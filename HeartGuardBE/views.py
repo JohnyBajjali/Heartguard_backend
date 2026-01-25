@@ -1,0 +1,454 @@
+# HeartGuardBE/views.py
+import json
+import uuid
+from pathlib import Path
+
+from django.http import JsonResponse, HttpResponse
+from django.views.decorators.csrf import csrf_exempt
+from django.views.decorators.http import require_GET
+from django.core.exceptions import ValidationError
+
+from .models import Patient, ECGUpload
+
+
+def normalize_name(name: str) -> str:
+    return " ".join((name or "").strip().split()).lower()
+
+
+def _patient_ecgs_from_ids(patient: "Patient"):
+    """
+    Return ECG list in the SAME order stored in patient.ecg_upload_ids (newest first).
+    Skips missing ECG ids safely.
+    """
+    ids = list(patient.ecg_upload_ids or [])
+    if not ids:
+        return []
+
+    qs = ECGUpload.objects.filter(id__in=ids)
+    by_id = {e.id: e for e in qs}
+
+    ecgs = []
+    for eid in ids:
+        ecg = by_id.get(eid)
+        if not ecg:
+            continue
+        ecgs.append({
+            "id": ecg.id,
+            "imageUrl": ecg.file.url,
+            "uploaded_at": ecg.uploaded_at.isoformat(),
+        })
+    return ecgs
+
+
+# ===========================
+# AUTO CROP (OpenCV) - FIXED
+# ===========================
+def _auto_crop_ecg_bytes(image_bytes: bytes) -> bytes:
+    """
+    Reliable ECG auto-crop (fixed):
+
+    1) Detect ECG paper (pink/red grid) using HSV
+    2) Crop to paper bounding box
+    3) Remove ONLY bottom footer titles band (small % so rhythm strip is kept)
+    4) Trim borders safely using edge projections (top/bottom + left/right)
+    5) Return JPEG bytes
+
+    Target result:
+    - No bottom titles (speed/gain/filter/id)
+    - Keep full 12-lead + rhythm strip
+    """
+    import numpy as np
+    import cv2
+
+    arr = np.frombuffer(image_bytes, dtype=np.uint8)
+    img = cv2.imdecode(arr, cv2.IMREAD_COLOR)  # BGR
+    if img is None:
+        raise ValueError("Could not decode image")
+
+    H, W = img.shape[:2]
+
+    def encode_jpg(bgr, quality=92):
+        ok, out = cv2.imencode(
+            ".jpg",
+            bgr,
+            [int(cv2.IMWRITE_JPEG_QUALITY), int(quality)]
+        )
+        return out.tobytes() if ok else image_bytes
+
+    def trim_by_projection(bgr, axis: int):
+        """
+        axis=0 => trim top/bottom (rows)
+        axis=1 => trim left/right (cols)
+        Uses edge projections so we don't cut ECG content.
+        """
+        gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
+        gray = cv2.GaussianBlur(gray, (5, 5), 0)
+        edges = cv2.Canny(gray, 60, 160)
+
+        proj = edges.sum(axis=axis).astype(np.float32)
+
+        # smooth
+        k = 31
+        ker = np.ones(k, dtype=np.float32) / k
+        proj_s = np.convolve(proj, ker, mode="same")
+
+        mx = float(proj_s.max() if proj_s.size else 0.0)
+        if mx <= 1e-6:
+            return bgr
+
+        thr = 0.12 * mx
+        idx = np.where(proj_s > thr)[0]
+        if idx.size == 0:
+            return bgr
+
+        a = int(idx[0])
+        b = int(idx[-1])
+
+        margin = 10
+        a = max(0, a - margin)
+        b = min((bgr.shape[0] - 1) if axis == 1 else (bgr.shape[1] - 1), b + margin)
+
+        if axis == 0:
+            # columns projection -> trim left/right
+            left, right = a, b
+            # keep at least 75% width
+            if (right - left + 1) > int(0.75 * bgr.shape[1]):
+                return bgr[:, left:right + 1]
+            return bgr
+        else:
+            # rows projection -> trim top/bottom
+            top, bottom = a, b
+            # keep at least 75% height
+            if (bottom - top + 1) > int(0.75 * bgr.shape[0]):
+                return bgr[top:bottom + 1, :]
+            return bgr
+
+    # -------------------------
+    # 1) Detect paper (pink/red)
+    # -------------------------
+    hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
+    h, s, v = cv2.split(hsv)
+
+    # ECG grid is usually red/pink => hue near 0 or near 180
+    mask1 = ((h >= 0) & (h <= 12) & (s >= 10) & (v >= 70))
+    mask2 = ((h >= 165) & (h <= 180) & (s >= 10) & (v >= 70))
+    mask = (mask1 | mask2).astype(np.uint8) * 255
+
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (25, 25))
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=2)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=1)
+
+    cnts, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not cnts:
+        # could not detect paper => return original
+        return encode_jpg(img, 92)
+
+    c = max(cnts, key=cv2.contourArea)
+    x, y, w, h_ = cv2.boundingRect(c)
+
+    # sanity: paper must be reasonably large
+    if w * h_ < 0.12 * (W * H):
+        return encode_jpg(img, 92)
+
+    pad = 8
+    x0 = max(0, x - pad)
+    y0 = max(0, y - pad)
+    x1 = min(W, x + w + pad)
+    y1 = min(H, y + h_ + pad)
+
+    paper = img[y0:y1, x0:x1]
+    ph, pw = paper.shape[:2]
+
+    # ---------------------------------------
+    # 2) Remove footer titles (FIXED)
+    # ---------------------------------------
+    # Your old value 0.25 was cutting the rhythm strip.
+    # Typical footer is around 8–12%.
+    footer_ratio = 0.12
+    cut_y = int(ph * (1.0 - footer_ratio))
+
+    # safety: keep at least 88% (do not over-cut)
+    min_keep = int(ph * 0.88)
+    cut_y = max(cut_y, min_keep)
+
+    if 0 < cut_y < ph:
+        paper = paper[:cut_y, :]
+
+    # -------------------------------------------
+    # 3) Trim borders safely (top/bottom + left/right)
+    # -------------------------------------------
+    # Top/bottom trimming
+    paper = trim_by_projection(paper, axis=1)
+    # Left/right trimming
+    paper = trim_by_projection(paper, axis=0)
+
+    # optional mild contrast (just improves visibility)
+    paper = cv2.convertScaleAbs(paper, alpha=1.05, beta=0)
+
+    # final safety
+    if paper.shape[0] < 80 or paper.shape[1] < 80:
+        return encode_jpg(img, 92)
+
+    return encode_jpg(paper, 92)
+
+
+# ===========================
+# API ENDPOINTS
+# ===========================
+@csrf_exempt
+def patients_list_create(request):
+    """
+    GET  /api/patients/          -> list patients
+    POST /api/patients/          -> create patient
+    """
+    if request.method == "GET":
+        patients = Patient.objects.all().order_by("-created_at")
+        data = []
+        for p in patients:
+            data.append({
+                "patient_id": p.patient_id,
+                "full_name": p.full_name,
+                "gender": p.gender,
+                "created_at": p.created_at.isoformat(),
+                "ecg_count": len(p.ecg_upload_ids or []),
+            })
+        return JsonResponse({"patients": data}, status=200)
+
+    if request.method == "POST":
+        try:
+            data = json.loads(request.body.decode("utf-8"))
+        except Exception:
+            return JsonResponse({"error": "Invalid JSON body"}, status=400)
+
+        patient_id_raw = str(data.get("patient_id", "")).strip()
+        full_name = str(data.get("full_name", "")).strip()
+        gender = data.get("gender", None)
+
+        if not patient_id_raw:
+            return JsonResponse({"error": "patient_id is required"}, status=400)
+        if not patient_id_raw.isdigit():
+            return JsonResponse({"error": "patient_id must be an integer"}, status=400)
+
+        if not full_name:
+            return JsonResponse({"error": "full_name is required"}, status=400)
+
+        patient_id = int(patient_id_raw)
+
+        if Patient.objects.filter(patient_id=patient_id).exists():
+            return JsonResponse({"error": "patient_id already exists"}, status=409)
+
+        if gender not in ("M", "F", None, ""):
+            return JsonResponse({"error": "gender must be 'M' or 'F' (or omitted)"}, status=400)
+        if gender == "":
+            gender = None
+
+        patient = Patient(patient_id=patient_id, full_name=full_name, gender=gender)
+        try:
+            patient.full_clean()
+        except ValidationError as e:
+            return JsonResponse({"error": e.message_dict or str(e)}, status=400)
+        patient.save()
+
+        return JsonResponse({
+            "patient": {
+                "patient_id": patient.patient_id,
+                "full_name": patient.full_name,
+                "gender": patient.gender,
+                "created_at": patient.created_at.isoformat(),
+                "ecg_count": len(patient.ecg_upload_ids or []),
+            }
+        }, status=201)
+
+    return JsonResponse({"error": "Method not allowed"}, status=405)
+
+
+@csrf_exempt
+def patient_login_or_create(request):
+    """
+    POST /api/patient/login_or_create/
+    """
+    if request.method != "POST":
+        return JsonResponse({"error": "POST required"}, status=405)
+
+    try:
+        data = json.loads(request.body.decode())
+    except Exception:
+        data = request.POST
+
+    name = str(data.get("name", "")).strip()
+    patient_id_raw = str(data.get("patient_id", "")).strip()
+
+    if not name:
+        return JsonResponse({"error": "name is required"}, status=400)
+
+    if not patient_id_raw:
+        return JsonResponse({"error": "patient_id is required"}, status=400)
+
+    if not patient_id_raw.isdigit():
+        return JsonResponse({"error": "patient_id must be an integer"}, status=400)
+
+    patient_id = int(patient_id_raw)
+
+    try:
+        patient = Patient.objects.get(patient_id=patient_id)
+        if normalize_name(patient.full_name) != normalize_name(name):
+            return JsonResponse(
+                {"error": "This ID is already registered to another person. Please use your own ID."},
+                status=409,
+            )
+        created = False
+    except Patient.DoesNotExist:
+        patient = Patient(patient_id=patient_id, full_name=name)
+        try:
+            patient.full_clean()
+        except ValidationError as e:
+            return JsonResponse({"error": e.message_dict or str(e)}, status=400)
+        patient.save()
+        created = True
+
+    ecgs = _patient_ecgs_from_ids(patient)
+
+    return JsonResponse(
+        {
+            "patient_id": patient.patient_id,
+            "name": patient.full_name,
+            "gender": patient.gender,
+            "ecgs": ecgs,
+            "created": created,
+        },
+        status=200,
+    )
+
+
+@csrf_exempt
+def ecg_upload(request):
+    """
+    POST /api/ecg/upload/  (multipart)
+    """
+    if request.method != "POST":
+        return JsonResponse({"error": "POST required"}, status=405)
+
+    uploaded_file = request.FILES.get("file")
+    source = request.POST.get("source", "mobile").strip()
+    patient_id_raw = request.POST.get("patient_id", "").strip()
+    patient_name = request.POST.get("patient_name", "").strip()
+
+    if not uploaded_file:
+        return JsonResponse({"error": "No file uploaded"}, status=400)
+
+    if not patient_name:
+        return JsonResponse({"error": "patient_name is required"}, status=400)
+
+    if not patient_id_raw:
+        return JsonResponse({"error": "patient_id is required"}, status=400)
+
+    if not patient_id_raw.isdigit():
+        return JsonResponse({"error": "patient_id must be an integer"}, status=400)
+
+    patient_id = int(patient_id_raw)
+
+    # Get or create patient + enforce same-name rule
+    try:
+        patient = Patient.objects.get(patient_id=patient_id)
+        if normalize_name(patient.full_name) != normalize_name(patient_name):
+            return JsonResponse(
+                {"error": "This ID is already registered to another person. Please use your own ID."},
+                status=409,
+            )
+    except Patient.DoesNotExist:
+        patient = Patient(patient_id=patient_id, full_name=patient_name)
+        try:
+            patient.full_clean()
+        except ValidationError as e:
+            return JsonResponse({"error": e.message_dict or str(e)}, status=400)
+        patient.save()
+
+    # Save ECG globally
+    ext = Path(uploaded_file.name).suffix.lower() or ".jpg"
+    new_filename = f"{uuid.uuid4()}{ext}"
+    uploaded_file.name = new_filename
+
+    ecg = ECGUpload.objects.create(
+        file=uploaded_file,
+        source=source,
+    )
+
+    ids = list(patient.ecg_upload_ids or [])
+    ids.insert(0, ecg.id)
+    patient.ecg_upload_ids = ids[:500]
+    patient.save(update_fields=["ecg_upload_ids"])
+
+    return JsonResponse(
+        {
+            "status": "ok",
+            "ecg_id": ecg.id,
+            "url": request.build_absolute_uri(ecg.file.url),
+            "filename": new_filename,
+            "source": ecg.source,
+            "uploaded_at": ecg.uploaded_at.isoformat(),
+            "patient_id": patient.patient_id,
+            "patient_name": patient.full_name,
+        },
+        status=201,
+    )
+
+
+@csrf_exempt
+def ecg_auto_crop(request):
+    """
+    POST /api/ecg/auto_crop/  (multipart)
+    Fields:
+      - file
+    Returns:
+      image/jpeg (cropped bytes)
+    """
+    if request.method != "POST":
+        return JsonResponse({"error": "POST required"}, status=405)
+
+    uploaded_file = request.FILES.get("file")
+    if not uploaded_file:
+        return JsonResponse({"error": "No file uploaded"}, status=400)
+
+    try:
+        cropped_jpg = _auto_crop_ecg_bytes(uploaded_file.read())
+    except Exception as e:
+        return JsonResponse({"error": f"auto crop failed: {e}"}, status=400)
+
+    return HttpResponse(cropped_jpg, content_type="image/jpeg")
+
+
+@require_GET
+def list_ecgs_for_patient(request):
+    """
+    GET /api/ecg/list/?patient_id=123
+    """
+    patient_id_raw = request.GET.get("patient_id", "").strip()
+    if not patient_id_raw:
+        return JsonResponse({"error": "patient_id is required"}, status=400)
+
+    if not patient_id_raw.isdigit():
+        return JsonResponse({"error": "patient_id must be an integer"}, status=400)
+
+    patient_id = int(patient_id_raw)
+
+    try:
+        patient = Patient.objects.get(patient_id=patient_id)
+    except Patient.DoesNotExist:
+        return JsonResponse({"error": "patient not found"}, status=404)
+
+    ecgs = _patient_ecgs_from_ids(patient)
+
+    return JsonResponse(
+        [
+            {
+                "id": e["id"],
+                "patient_id": patient.patient_id,
+                "patient_name": patient.full_name,
+                "url": request.build_absolute_uri(e["imageUrl"]),
+                "uploaded_at": e["uploaded_at"],
+            }
+            for e in ecgs
+        ],
+        safe=False,
+        status=200,
+    )
