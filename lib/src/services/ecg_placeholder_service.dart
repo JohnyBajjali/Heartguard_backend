@@ -39,7 +39,7 @@ class EcgPlaceholderService {
 
     // Simple ECG wave
     final wave = Path();
-    const mid = height / 2.0;
+    final mid = height / 2.0;
     wave.moveTo(0, mid);
     for (double x = 0; x < width; x += 160) {
       wave.quadraticBezierTo(x + 20, mid - 12, x + 40, mid);

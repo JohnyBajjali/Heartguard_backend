@@ -1,5 +1,5 @@
 import 'dart:typed_data';
-import 'dart:io';
+import 'dart:io' show File, Platform;
 
 import 'package:flutter/material.dart';
 import 'package:flutter/foundation.dart' show kIsWeb;
@@ -9,16 +9,24 @@ import 'package:image_cropper/image_cropper.dart';
 import 'package:path/path.dart' as p;
 import 'package:path_provider/path_provider.dart';
 
+import '../screens/manual_crop_screen.dart';
 import '../services/ecg_upload_service.dart';
-import '../services/ecg_placeholder_service.dart';
 import '../widgets/action_card.dart';
 import '../widgets/preview_card.dart';
 import '../widgets/recent_thumb.dart';
-import '../widgets/step_chip.dart';
 import '../painters/ecg_header_painters.dart';
 
 class CaptureUploadScreen extends StatefulWidget {
-  const CaptureUploadScreen({super.key});
+  final String patientId;
+  final String patientName;
+  final bool startWithScanner;
+
+  const CaptureUploadScreen({
+    super.key,
+    required this.patientId,
+    required this.patientName,
+    this.startWithScanner = false,
+  });
 
   @override
   State<CaptureUploadScreen> createState() => _CaptureUploadScreenState();
@@ -31,40 +39,29 @@ class _CaptureUploadScreenState extends State<CaptureUploadScreen> {
   bool _isUploading = false;
 
   final List<ImageProvider> _recent = [];
-  final TextEditingController _patientNameController = TextEditingController();
 
   @override
   void initState() {
     super.initState();
-    _loadSamplePlaceholders();
-  }
 
-  @override
-  void dispose() {
-    _patientNameController.dispose();
-    super.dispose();
-  }
-
-  /* -------------------- INIT PLACEHOLDERS -------------------- */
-
-  Future<void> _loadSamplePlaceholders() async {
-    final bytes = await EcgPlaceholderService.generateSampleEcgPngBytes();
-    if (!mounted) return;
-    setState(() {
-      _recent
-        ..clear()
-        ..addAll(List.generate(4, (_) => MemoryImage(bytes)));
-    });
+    if (widget.startWithScanner) {
+      Future.microtask(() async {
+        if (!mounted) return;
+        await _scanWithCamera();
+      });
+    }
   }
 
   /* -------------------- IMAGE PICK / SCAN -------------------- */
 
   Future<void> _pickImage(ImageSource source) async {
     final picker = ImagePicker();
-    final picked = await picker.pickImage(source: source);
+    final picked = await picker.pickImage(source: source, imageQuality: 95);
     if (picked == null) return;
 
     final bytes = await picked.readAsBytes();
+    if (!mounted) return;
+
     setState(() {
       _imageBytes = bytes;
       _fileName = p.basename(picked.path);
@@ -74,13 +71,23 @@ class _CaptureUploadScreenState extends State<CaptureUploadScreen> {
   }
 
   Future<void> _scanWithCamera() async {
+    // WEB: camera
     if (kIsWeb) {
       await _pickImage(ImageSource.camera);
       return;
     }
 
+    final isMobile = Platform.isAndroid || Platform.isIOS;
+
+    // DESKTOP: camera/scanner not reliable → pick file
+    if (!isMobile) {
+      await _pickImage(ImageSource.gallery);
+      return;
+    }
+
+    // ANDROID/iOS: MLKit scanner
     final scanner = DocumentScanner(
-      options: const DocumentScannerOptions(
+      options: DocumentScannerOptions(
         documentFormat: DocumentFormat.jpeg,
         mode: ScannerMode.filter,
         pageLimit: 1,
@@ -90,11 +97,13 @@ class _CaptureUploadScreenState extends State<CaptureUploadScreen> {
 
     try {
       final result = await scanner.scanDocument();
-      if (!mounted || result == null) return;
+      if (!mounted) return;
 
       if (result.images.isNotEmpty) {
         final firstPath = result.images.first;
         final bytes = await File(firstPath).readAsBytes();
+
+        if (!mounted) return;
         setState(() {
           _imageBytes = bytes;
           _fileName = p.basename(firstPath);
@@ -102,10 +111,10 @@ class _CaptureUploadScreenState extends State<CaptureUploadScreen> {
           _rememberRecent(MemoryImage(bytes));
         });
       } else if (result.pdf != null) {
-        _showSnack('PDF returned; configure images if you want PNG/JPEG.');
+        _showSnack('Scanner returned PDF; configure scanner to return images.');
       }
     } catch (e) {
-      _showSnack('Scan cancelled or failed: $e');
+      if (mounted) _showSnack('Scan cancelled or failed: $e');
     } finally {
       await scanner.close();
     }
@@ -118,23 +127,36 @@ class _CaptureUploadScreenState extends State<CaptureUploadScreen> {
   Future<void> _manualCrop() async {
     if (_imageBytes == null) return;
 
-    String sourcePath;
-    if (kIsWeb) {
-      if (_imagePath == null) {
-        _showSnack('Please pick or scan an image again before cropping.');
-        return;
-      }
-      sourcePath = _imagePath!;
-    } else {
-      final temp = await _bytesToTempFile(
-        _imageBytes!,
-        fileName: _fileName ?? 'ecg.png',
+    final isMobile = !kIsWeb && (Platform.isAndroid || Platform.isIOS);
+
+    // ✅ Web + Desktop: real crop screen (resizable + Done)
+    if (!isMobile) {
+      final croppedBytes = await Navigator.of(context).push<Uint8List>(
+        MaterialPageRoute(
+          builder: (_) => ManualCropScreen(imageBytes: _imageBytes!),
+        ),
       );
-      sourcePath = temp.path;
+
+      if (croppedBytes == null) return;
+
+      setState(() {
+        _imageBytes = croppedBytes;
+        _fileName = _fileName ?? 'ecg.jpg';
+        _rememberRecent(MemoryImage(croppedBytes));
+      });
+      return;
     }
 
+    // ✅ Mobile: image_cropper
+    final temp = await _bytesToTempFile(
+      _imageBytes!,
+      fileName: _fileName ?? 'ecg.jpg',
+    );
+
     final cropped = await ImageCropper().cropImage(
-      sourcePath: sourcePath,
+      sourcePath: temp.path,
+      compressFormat: ImageCompressFormat.jpg,
+      compressQuality: 95,
       uiSettings: [
         AndroidUiSettings(
           toolbarTitle: 'Crop ECG Area',
@@ -142,14 +164,15 @@ class _CaptureUploadScreenState extends State<CaptureUploadScreen> {
           lockAspectRatio: false,
           showCropGrid: true,
         ),
-        const IOSUiSettings(title: 'Crop ECG Area'),
-        WebUiSettings(context: context),
+        IOSUiSettings(title: 'Crop ECG Area'),
       ],
     );
 
     if (cropped == null) return;
 
     final bytes = await cropped.readAsBytes();
+    if (!mounted) return;
+
     setState(() {
       _imageBytes = bytes;
       _fileName = p.basename(cropped.path);
@@ -160,7 +183,11 @@ class _CaptureUploadScreenState extends State<CaptureUploadScreen> {
 
   Future<void> _autoCropEcgRoi() async {
     if (_imageBytes == null) return;
-    _showSnack('Auto-crop coming soon — use manual crop for now.');
+
+    _showSnack('Auto-crop coming next (OpenCV endpoint).');
+    // later:
+    // final cropped = await EcgUploadService.autoCropEcg(...);
+    // setState(() => _imageBytes = cropped);
   }
 
   /* -------------------- UPLOAD -------------------- */
@@ -168,12 +195,6 @@ class _CaptureUploadScreenState extends State<CaptureUploadScreen> {
   Future<void> _uploadToServer() async {
     if (_imageBytes == null) {
       _showSnack('Please scan or import an ECG first.');
-      return;
-    }
-
-    final patientName = _patientNameController.text.trim();
-    if (patientName.isEmpty) {
-      _showSnack('Please enter the patient name.');
       return;
     }
 
@@ -185,21 +206,22 @@ class _CaptureUploadScreenState extends State<CaptureUploadScreen> {
       final streamedResp = await EcgUploadService.uploadEcg(
         imageBytes: _imageBytes!,
         fileName: fileName,
-        patientName: patientName,
+        patientName: widget.patientName,
+        patientId: widget.patientId,
       );
 
       final body = await streamedResp.stream.bytesToString();
 
-      if (streamedResp.statusCode >= 200 &&
-          streamedResp.statusCode < 300) {
-        _showSnack('✅ Uploaded! Server response: $body');
+      if (streamedResp.statusCode >= 200 && streamedResp.statusCode < 300) {
+        if (mounted) _showSnack('✅ Uploaded!');
+        if (mounted) Navigator.pop(context);
       } else {
-        _showSnack(
-          '❌ Upload failed [${streamedResp.statusCode}]: $body',
-        );
+        if (mounted) {
+          _showSnack('❌ Upload failed [${streamedResp.statusCode}]: $body');
+        }
       }
     } catch (e) {
-      _showSnack('Error uploading: $e');
+      if (mounted) _showSnack('Error uploading: $e');
     } finally {
       if (mounted) setState(() => _isUploading = false);
     }
@@ -217,10 +239,9 @@ class _CaptureUploadScreenState extends State<CaptureUploadScreen> {
         slivers: [
           _buildHeader(context),
           _buildActionRow(),
-          _buildPatientField(),
+          _buildPatientCard(),
           if (hasImage) _buildPreview(),
           _buildRecentSection(),
-          _buildPipelineChips(),
         ],
       ),
       bottomNavigationBar: _buildBottomBar(hasImage),
@@ -280,7 +301,7 @@ class _CaptureUploadScreenState extends State<CaptureUploadScreen> {
             Expanded(
               child: ActionCard(
                 title: 'Scan / Camera',
-                subtitle: 'Take a photo of the paper',
+                subtitle: 'Mobile: scanner • Web: camera • Desktop: file',
                 icon: Icons.camera_alt_rounded,
                 color: const Color(0xFF1C7C80),
                 onTap: _scanWithCamera,
@@ -302,16 +323,58 @@ class _CaptureUploadScreenState extends State<CaptureUploadScreen> {
     );
   }
 
-  SliverToBoxAdapter _buildPatientField() {
+  SliverToBoxAdapter _buildPatientCard() {
     return SliverToBoxAdapter(
       child: Padding(
         padding: const EdgeInsets.fromLTRB(16, 8, 16, 8),
-        child: TextField(
-          controller: _patientNameController,
-          decoration: const InputDecoration(
-            labelText: 'Patient Name',
-            hintText: 'Enter patient name',
-            border: OutlineInputBorder(),
+        child: Container(
+          padding: const EdgeInsets.all(14),
+          decoration: BoxDecoration(
+            color: Colors.white,
+            borderRadius: BorderRadius.circular(14),
+            border: Border.all(color: Colors.black.withValues(alpha: 0.06)),
+            boxShadow: [
+              BoxShadow(
+                color: Colors.black.withValues(alpha: 0.05),
+                blurRadius: 16,
+                offset: const Offset(0, 8),
+              ),
+            ],
+          ),
+          child: Row(
+            children: [
+              Container(
+                width: 44,
+                height: 44,
+                decoration: BoxDecoration(
+                  color: const Color(0xFFEEF6FF),
+                  borderRadius: BorderRadius.circular(12),
+                ),
+                child: const Icon(Icons.person_outline),
+              ),
+              const SizedBox(width: 12),
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      widget.patientName,
+                      style: const TextStyle(
+                        fontSize: 16,
+                        fontWeight: FontWeight.w700,
+                      ),
+                    ),
+                    const SizedBox(height: 4),
+                    Text(
+                      'ID: ${widget.patientId}',
+                      style: TextStyle(
+                        color: Colors.black.withValues(alpha: 0.60),
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ],
           ),
         ),
       ),
@@ -323,80 +386,93 @@ class _CaptureUploadScreenState extends State<CaptureUploadScreen> {
       child: Padding(
         padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
         child: PreviewCard(
+          onCrop: _manualCrop,
+          onAutoTrim: _autoCropEcgRoi,
           child: ClipRRect(
             borderRadius: BorderRadius.circular(18),
             child: Image.memory(_imageBytes!, fit: BoxFit.cover),
           ),
-          onCrop: _manualCrop,
-          onAutoTrim: _autoCropEcgRoi,
         ),
       ),
     );
   }
 
   SliverToBoxAdapter _buildRecentSection() {
+    final theme = Theme.of(context);
+
     return SliverToBoxAdapter(
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
           Padding(
-            padding: const EdgeInsets.fromLTRB(16, 8, 16, 0),
+            padding: const EdgeInsets.fromLTRB(16, 10, 16, 0),
             child: Row(
               children: [
                 Text(
                   'Recent ECGs',
-                  style: Theme.of(context).textTheme.titleMedium?.copyWith(
-                    fontWeight: FontWeight.w600,
+                  style: theme.textTheme.titleMedium?.copyWith(
+                    fontWeight: FontWeight.w700,
                   ),
                 ),
                 const Spacer(),
-                TextButton(
-                  onPressed: () {},
-                  child: const Text('View all'),
-                ),
+                if (_recent.isNotEmpty)
+                  TextButton(
+                    onPressed: () {},
+                    child: const Text('View all'),
+                  ),
               ],
             ),
           ),
-          SizedBox(
-            height: 120,
-            child: ListView.separated(
-              padding:
-              const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
-              scrollDirection: Axis.horizontal,
-              itemCount: _recent.length,
-              separatorBuilder: (_, __) => const SizedBox(width: 12),
-              itemBuilder: (_, i) {
-                return RecentThumb(
-                  image: _recent[i],
-                  onTap: () {
-                    if (_recent[i] is MemoryImage) {
-                      final mem = _recent[i] as MemoryImage;
-                      setState(() => _imageBytes = mem.bytes);
-                    }
-                  },
-                );
-              },
+          if (_recent.isEmpty)
+            Padding(
+              padding: const EdgeInsets.fromLTRB(16, 10, 16, 10),
+              child: Container(
+                width: double.infinity,
+                padding: const EdgeInsets.all(16),
+                decoration: BoxDecoration(
+                  color: Colors.white,
+                  borderRadius: BorderRadius.circular(14),
+                  border: Border.all(color: Colors.black.withValues(alpha: 0.06)),
+                ),
+                child: Row(
+                  children: [
+                    const Icon(Icons.history, color: Colors.black45),
+                    const SizedBox(width: 10),
+                    Expanded(
+                      child: Text(
+                        'No recent ECGs in this session.',
+                        style: TextStyle(
+                          color: Colors.black.withValues(alpha: 0.65),
+                        ),
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            )
+          else
+            SizedBox(
+              height: 120,
+              child: ListView.separated(
+                padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+                scrollDirection: Axis.horizontal,
+                itemCount: _recent.length,
+                separatorBuilder: (_, __) => const SizedBox(width: 12),
+                itemBuilder: (_, i) {
+                  return RecentThumb(
+                    image: _recent[i],
+                    onTap: () {
+                      if (_recent[i] is MemoryImage) {
+                        final mem = _recent[i] as MemoryImage;
+                        setState(() => _imageBytes = mem.bytes);
+                      }
+                    },
+                  );
+                },
+              ),
             ),
-          ),
+          const SizedBox(height: 120),
         ],
-      ),
-    );
-  }
-
-  SliverToBoxAdapter _buildPipelineChips() {
-    return SliverToBoxAdapter(
-      child: Padding(
-        padding: const EdgeInsets.fromLTRB(16, 8, 16, 100),
-        child: Wrap(
-          spacing: 8,
-          runSpacing: -6,
-          children: const [
-            StepChip(label: 'Auto-crop grid'),
-            StepChip(label: 'Deskew & de-shadow'),
-            StepChip(label: 'Digitize waveform'),
-            StepChip(label: 'Send to AI model'),
-          ],
-        ),
       ),
     );
   }
@@ -456,6 +532,7 @@ class _CaptureUploadScreenState extends State<CaptureUploadScreen> {
   }
 
   void _showSnack(String msg) {
+    if (!mounted) return;
     ScaffoldMessenger.of(context).showSnackBar(
       SnackBar(content: Text(msg)),
     );

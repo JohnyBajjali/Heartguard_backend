@@ -2,7 +2,7 @@
 
 class EcgRecord {
   final int id;
-  final String imageUrl;
+  final String imageUrl; // can be relative (/media/...) or absolute (http://...)
   final DateTime uploadedAt;
 
   EcgRecord({
@@ -12,23 +12,27 @@ class EcgRecord {
   });
 
   factory EcgRecord.fromJson(Map<String, dynamic> json) {
+    final rawUrl = (json['imageUrl'] ?? json['url'] ?? json['file'] ?? '').toString();
+
     return EcgRecord(
-      id: json['id'] as int,
-      imageUrl: json['file'] as String,           // e.g. "/media/ecgs/123.png"
+      id: (json['id'] as num).toInt(),
+      imageUrl: rawUrl,
       uploadedAt: DateTime.parse(json['uploaded_at'] as String),
     );
   }
 }
 
 class Patient {
-  final String id;        // The patient ID that the user types (string)
+  final String id; // patient_id as string (UI uses text fields)
   final String name;
+  final String? gender; // "M"/"F"/null
   final List<EcgRecord> ecgs;
 
   Patient({
     required this.id,
     required this.name,
     required this.ecgs,
+    this.gender,
   });
 
   factory Patient.fromJson(Map<String, dynamic> json) {
@@ -38,7 +42,8 @@ class Patient {
 
     return Patient(
       id: json['patient_id'].toString(),
-      name: json['name'] as String,
+      name: (json['name'] ?? json['full_name'] ?? '').toString(),
+      gender: json['gender']?.toString(),
       ecgs: ecgList,
     );
   }
