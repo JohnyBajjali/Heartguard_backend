@@ -2,6 +2,7 @@
 import json
 import uuid
 from pathlib import Path
+import numpy as np
 
 from django.http import JsonResponse, HttpResponse
 from django.views.decorators.csrf import csrf_exempt
@@ -9,6 +10,10 @@ from django.views.decorators.http import require_GET
 from django.core.exceptions import ValidationError
 
 from .models import Patient, ECGUpload
+from .ml.philips_xml import read_hospital_ecg_xml_repbeats
+from .ml.preprocess import preprocess_single_ecg
+from .ml.predictor import FusionPredictor
+from HeartGuardBE.ml import predictor
 
 
 def normalize_name(name: str) -> str:
@@ -452,3 +457,38 @@ def list_ecgs_for_patient(request):
         safe=False,
         status=200,
     )
+
+@csrf_exempt
+def predict_philips_xml(request):
+    if request.method != "POST":
+        return JsonResponse({"error": "POST only"}, status=405)
+
+    if "file" not in request.FILES:
+        return JsonResponse({"error": "missing file field"}, status=400)
+
+    xml_bytes = request.FILES["file"].read()
+
+    # 1) parse XML -> leads
+    leads_mV, fs, meta = read_hospital_ecg_xml_repbeats(xml_bytes)
+
+    # 2) preprocess -> (1,1000,12)
+    X, fs_out = preprocess_single_ecg(leads_mV, fs_in=fs, fs_target=100, target_len=1000, remove_baseline=True)
+
+    # 3) predict
+    predictor = FusionPredictor.instance()
+    print("LABELS_FIRST_10:", predictor.fusion_labels[:10])
+    print("LABELS_COUNT:", len(predictor.fusion_labels))
+
+    probs = predictor.predict_from_X(X)
+
+    # 4) topk
+    labels = predictor.fusion_labels
+    topk = 10
+    idx = np.argsort(-probs)[:topk]
+
+    out = [{"label": labels[i], "p": float(probs[i])} for i in idx]
+
+    return JsonResponse({
+        "topk": out,
+        "meta": {"fs_in": fs, "fs_out": fs_out, "xml_meta": meta},
+    }, status=200)
