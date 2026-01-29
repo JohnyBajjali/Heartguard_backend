@@ -1,0 +1,16 @@
+{
+    "name": "Dataset504_Signals_mixed_binary",
+    "description": "Binary ECG segmentation (mixed synthetic subset + repeated real).",
+    "reference": "",
+    "licence": "",
+    "release": "1.0",
+    "channel_names": {
+        "0": "ecg"
+    },
+    "labels": {
+        "background": 0,
+        "foreground": 1
+    },
+    "numTraining": 7520,
+    "file_ending": ".nii.gz"
+}

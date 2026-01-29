@@ -10,6 +10,8 @@ DEBUG = True
 
 ALLOWED_HOSTS = ["*",]  # dev only; lock down in prod
 
+NNUNET_RESULTS_DIR = str(Path(BASE_DIR) / "HeartGuardBE" / "nnUNet_results")
+
 INSTALLED_APPS = [
     # Jazzmin admin theme (must be before django.contrib.admin)
     "jazzmin",

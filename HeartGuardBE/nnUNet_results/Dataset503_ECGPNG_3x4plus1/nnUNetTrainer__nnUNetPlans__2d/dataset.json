@@ -1,0 +1,22 @@
+{
+    "channel_names": {
+        "0": "ECG"
+    },
+    "labels": {
+        "background": 0,
+        "lead_1": 1,
+        "lead_2": 2,
+        "lead_3": 3,
+        "lead_4": 4,
+        "lead_5": 5,
+        "lead_6": 6,
+        "lead_7": 7,
+        "lead_8": 8,
+        "lead_9": 9,
+        "lead_10": 10,
+        "lead_11": 11,
+        "lead_12": 12
+    },
+    "numTraining": 13270,
+    "file_ending": ".png"
+}
