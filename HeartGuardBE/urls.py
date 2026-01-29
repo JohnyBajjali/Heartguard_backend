@@ -6,7 +6,7 @@ from .views import (
     patient_login_or_create,
     list_ecgs_for_patient,
     patients_list_create,
-    predict_philips_xml,
+    predict_ecg,
 )
 
 urlpatterns = [
@@ -14,6 +14,6 @@ urlpatterns = [
     path("patients/", patients_list_create, name="patients_list_create"),
     path("ecg/upload/", ecg_upload, name="ecg_upload"),
     path("ecg/auto_crop/", ecg_auto_crop, name="ecg_auto_crop"),
-    path("ecg/predict_philips_xml/", predict_philips_xml, name="predict_philips_xml"),
+     path("ecg/predict/", predict_ecg, name="predict_ecg"),
     path("ecg/list/", list_ecgs_for_patient, name="ecg_list_for_patient"),
 ]
