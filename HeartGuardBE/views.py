@@ -10,10 +10,10 @@ from django.views.decorators.http import require_GET
 from django.core.exceptions import ValidationError
 
 from .models import Patient, ECGUpload
-from .ml.philips_xml import read_hospital_ecg_xml_repbeats
-from .ml.preprocess import preprocess_single_ecg
-from .ml.predictor import FusionPredictor
-from HeartGuardBE.ml import predictor
+from .protoecgnet_Model.philips_xml import read_hospital_ecg_xml_repbeats
+from .protoecgnet_Model.preprocess import preprocess_single_ecg
+from .protoecgnet_Model.predictor import FusionPredictor
+from HeartGuardBE.protoecgnet_Model import predictor
 
 
 def normalize_name(name: str) -> str:
