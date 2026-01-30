@@ -11,6 +11,13 @@ DEBUG = True
 ALLOWED_HOSTS = ["*",]  # dev only; lock down in prod
 
 NNUNET_RESULTS_DIR = str(Path(BASE_DIR) / "HeartGuardBE" / "nnUNet_results")
+NNUNET_CHECKPOINT = "checkpoint_best.pth"
+NNUNET_CFG = "2d"
+
+NNUNET_DATASET_3X4PLUS1 = "503"   # your Dataset503...
+NNUNET_DATASET_3X4 = "504"        # your Dataset504...
+NNUNET_FOLDS = ["0", "1", "2", "3", "4"]
+
 
 INSTALLED_APPS = [
     # Jazzmin admin theme (must be before django.contrib.admin)

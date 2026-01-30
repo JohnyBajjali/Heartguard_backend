@@ -1,4 +1,4 @@
-# HeartGuardBE/ml/preprocess.py
+# HeartGuardBE/protoecgnet_Model/preprocess.py
 import numpy as np
 from scipy.signal import butter, filtfilt, resample_poly
 
