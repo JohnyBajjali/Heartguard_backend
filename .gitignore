@@ -79,3 +79,9 @@ app.*.map.json
 HeartGuardBE/inference/
 HeartGuardBE/nnUNet_results/
 
+
+# Large local artifacts
+*.zip
+HeartGuardBE/inference/
+HeartGuardBE/nnUNet_results/
+
