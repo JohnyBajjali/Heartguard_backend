@@ -73,3 +73,9 @@ app.*.map.json
 /android/app/profile
 /android/app/release
 >>>>>>> f960409ce57fa25d0d9349c42c2560c5393ea3db
+
+# Large local artifacts
+*.zip
+HeartGuardBE/inference/
+HeartGuardBE/nnUNet_results/
+
