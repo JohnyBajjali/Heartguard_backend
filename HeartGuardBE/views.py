@@ -4,6 +4,9 @@ import uuid
 from pathlib import Path
 import numpy as np
 from lxml import etree
+from django.conf import settings
+import cv2
+import nibabel as nib
 
 from django.http import JsonResponse, HttpResponse
 from django.views.decorators.csrf import csrf_exempt
@@ -17,7 +20,9 @@ from .protoecgnet_Model.preprocess import preprocess_single_ecg
 from .protoecgnet_Model.predictor import FusionPredictor
 from HeartGuardBE.protoecgnet_Model import predictor
 
-
+from .inference.preprocess_3x4 import preprocess_3x4
+from .inference.nnunet_runner import run_nnunet
+from .inference.digitize_binary_3x4 import digitize_from_binary_mask_3x4 
 
 def normalize_name(name: str) -> str:
     return " ".join((name or "").strip().split()).lower()
@@ -462,20 +467,110 @@ def list_ecgs_for_patient(request):
     )
 
 def detect_ecg_format(file_bytes: bytes) -> str:
+    # 1) try xml (philips/aecg)
     parser = etree.XMLParser(recover=True, huge_tree=True)
     try:
         root = etree.fromstring(file_bytes, parser)
+        if "annotatedecg" in root.tag.lower():
+            return "aecg"
+        if root.xpath('//*[local-name()="repbeats" or local-name()="repbeat"]'):
+            return "philips"
     except Exception:
-        return "unknown"
+        pass
 
-    # HL7 aECG
-    if "annotatedecg" in root.tag.lower():
-        return "aecg"
-
-    if root.xpath('//*[local-name()="repbeats" or local-name()="repbeat"]'):
-        return "philips"
+    # 2) try image
+    try:
+        buf = np.frombuffer(file_bytes, dtype=np.uint8)
+        img = cv2.imdecode(buf, cv2.IMREAD_COLOR)
+        if img is not None:
+            return "image_3x4"
+    except Exception:
+        pass
 
     return "unknown"
+
+def _predict_from_3x4_image_bytes(img_bytes: bytes, filename: str = "upload.png"):
+    dataset_id = "504"
+    target_len = 1000
+    px_per_mV = 40.0        
+    fs_in_digitizer = 100     
+
+    media_root = Path(getattr(settings, "MEDIA_ROOT", Path(__file__).resolve().parents[1] / "media"))
+    job_id = uuid.uuid4().hex
+
+    out_dir = media_root / "test_out" / "3x4_api" / job_id
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    # 1) Save the image
+    src_path = out_dir / f"src_{Path(filename).stem}.png"
+    buf = np.frombuffer(img_bytes, dtype=np.uint8)
+    img = cv2.imdecode(buf, cv2.IMREAD_COLOR)
+    if img is None:
+        raise ValueError("Failed to decode image bytes (not a valid PNG/JPG).")
+    cv2.imwrite(str(src_path), img)
+
+    # 2) preprocess 
+    pre_png = out_dir / f"pre_{src_path.stem}.png"
+    preprocess_3x4(src_path, pre_png)
+
+    # 3) PNG -> NIfTI  Dataset 504
+    pre_gray = cv2.imread(str(pre_png), cv2.IMREAD_GRAYSCALE)
+    if pre_gray is None:
+        raise ValueError(f"Failed to read preprocessed png: {pre_png}")
+
+    nii_in = out_dir / f"{pre_png.stem}.nii.gz"
+    vol = pre_gray.astype(np.float32)[None, ...]  # (1,H,W)
+    nib.save(nib.Nifti1Image(vol, affine=np.eye(4)), str(nii_in))
+
+    # 4) run nnU-Net (504) -> pred .nii.gz
+    pred_nii = run_nnunet(nii_in, dataset_id=dataset_id, is_png=False)
+
+    # 5) pred -> binary mask png
+    arr = nib.load(str(pred_nii)).get_fdata()
+    arr2 = arr[0] if arr.ndim == 3 else arr
+    mask = (arr2 > 0.5).astype(np.uint8) * 255
+
+    mask_png = out_dir / f"mask_{job_id}.png"
+    cv2.imwrite(str(mask_png), mask)
+
+    # 6) digitize 12 leads 
+    leads_mV = digitize_from_binary_mask_3x4(
+        mask_png_path=str(mask_png),
+        target_len_samples=target_len,
+        px_per_mV=px_per_mV,
+    )
+
+    # 7) preprocess
+    X, fs_out = preprocess_single_ecg(
+        leads_mV, fs_in=fs_in_digitizer,
+        fs_target=100, target_len=1000, remove_baseline=True
+    )
+
+    # 8) fusion diagnosis
+    predictor = FusionPredictor.instance()
+    probs = predictor.predict_from_X(X)
+    labels = predictor.fusion_labels
+    idx = np.argsort(-probs)[:10]
+    topk = [{"label": labels[i], "p": float(probs[i])} for i in idx]
+
+    meta = {
+        "format": "image_3x4",
+        "dataset_id": dataset_id,
+        "target_len": target_len,
+        "px_per_mV": px_per_mV,
+        "fs_in_digitizer": fs_in_digitizer,
+        "fs_out": fs_out,
+        "debug_paths": {
+            "src": str(src_path),
+            "pre_png": str(pre_png),
+            "nii_in": str(nii_in),
+            "pred_nii": str(pred_nii),
+            "mask_png": str(mask_png),
+        }
+    }
+    return topk, meta
+
+
 
 @csrf_exempt
 def predict_ecg(request):
@@ -485,28 +580,53 @@ def predict_ecg(request):
     if "file" not in request.FILES:
         return JsonResponse({"error": "missing file field"}, status=400)
 
-    file_bytes = request.FILES["file"].read()
+    up = request.FILES["file"]
+    file_bytes = up.read()
     fmt = detect_ecg_format(file_bytes)
 
-    if fmt == "philips":
-        leads_mV, fs, meta = read_hospital_ecg_xml_repbeats(file_bytes)
-        meta_key = "xml_meta"
-    elif fmt == "aecg":
-        leads_mV, fs, meta = read_aecg_hl7_bytes(file_bytes)
-        meta_key = "aecg_meta"
-    else:
-        return JsonResponse({"error": "Unknown ECG file format (expected Philips XML or HL7 aECG)."}, status=400)
+    try:
+        # ===== XML / aECG =====
+        if fmt == "philips":
+            leads_mV, fs, meta = read_hospital_ecg_xml_repbeats(file_bytes)
+            meta_key = "xml_meta"
 
-    X, fs_out = preprocess_single_ecg(leads_mV, fs_in=fs, fs_target=100, target_len=1000, remove_baseline=True)
+            X, fs_out = preprocess_single_ecg(leads_mV, fs_in=fs, fs_target=100, target_len=1000, remove_baseline=True)
+            predictor = FusionPredictor.instance()
+            probs = predictor.predict_from_X(X)
 
-    predictor = FusionPredictor.instance()
-    probs = predictor.predict_from_X(X)
+            labels = predictor.fusion_labels
+            idx = np.argsort(-probs)[:10]
+            out = [{"label": labels[i], "p": float(probs[i])} for i in idx]
 
-    labels = predictor.fusion_labels
-    idx = np.argsort(-probs)[:10]
-    out = [{"label": labels[i], "p": float(probs[i])} for i in idx]
+            return JsonResponse({
+                "topk": out,
+                "meta": {"fs_in": fs, "fs_out": fs_out, meta_key: meta, "format": fmt},
+            }, status=200)
 
-    return JsonResponse({
-        "topk": out,
-        "meta": {"fs_in": fs, "fs_out": fs_out, meta_key: meta, "format": fmt},
-    }, status=200)
+        if fmt == "aecg":
+            leads_mV, fs, meta = read_aecg_hl7_bytes(file_bytes)
+            meta_key = "aecg_meta"
+
+            X, fs_out = preprocess_single_ecg(leads_mV, fs_in=fs, fs_target=100, target_len=1000, remove_baseline=True)
+            predictor = FusionPredictor.instance()
+            probs = predictor.predict_from_X(X)
+
+            labels = predictor.fusion_labels
+            idx = np.argsort(-probs)[:10]
+            out = [{"label": labels[i], "p": float(probs[i])} for i in idx]
+
+            return JsonResponse({
+                "topk": out,
+                "meta": {"fs_in": fs, "fs_out": fs_out, meta_key: meta, "format": fmt},
+            }, status=200)
+
+        # ===== IMAGE 3x4 =====
+        if fmt == "image_3x4":
+            topk, meta = _predict_from_3x4_image_bytes(file_bytes, filename=getattr(up, "name", "upload.png"))
+            return JsonResponse({"topk": topk, "meta": meta}, status=200)
+
+        return JsonResponse({"error": "Unknown format. Expected Philips XML, HL7 aECG, or 3x4 PNG/JPG."}, status=400)
+
+    except Exception as e:
+        return JsonResponse({"error": str(e), "format": fmt}, status=500)
+
