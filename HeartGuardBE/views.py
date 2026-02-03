@@ -20,9 +20,11 @@ from .protoecgnet_Model.preprocess import preprocess_single_ecg
 from .protoecgnet_Model.predictor import FusionPredictor
 from HeartGuardBE.protoecgnet_Model import predictor
 
-from .inference.preprocess_3x4 import preprocess_3x4
-from .inference.nnunet_runner import run_nnunet
-from .inference.digitize_binary_3x4 import digitize_from_binary_mask_3x4 
+from HeartGuardBE.inference.postprocess import nii_to_png_mask
+from HeartGuardBE.inference.preprocess_3x4 import preprocess_3x4
+from HeartGuardBE.inference.nnunet_runner import run_nnunet
+from HeartGuardBE.inference.digitize_binary_3x4 import digitize_from_binary_mask_3x4 
+from HeartGuardBE.inference.vis_504_outputs import plot_like_original_3x4 as plot_like_original_3x4_vis
 
 def normalize_name(name: str) -> str:
     return " ".join((name or "").strip().split()).lower()
@@ -489,11 +491,21 @@ def detect_ecg_format(file_bytes: bytes) -> str:
 
     return "unknown"
 
+def _norm_code(s: str) -> str:
+    if s is None:
+        return ""
+    s = str(s)
+    s = s.replace("\ufeff", "")   # BOM
+    s = s.replace("\u200b", "")   # zero width space
+    s = s.replace("\u00a0", " ")  # non-breaking space
+    return s.strip()
+
+
 def _predict_from_3x4_image_bytes(img_bytes: bytes, filename: str = "upload.png"):
     dataset_id = "504"
     target_len = 1000
-    px_per_mV = 40.0        
-    fs_in_digitizer = 100     
+    px_per_mV = 40.0
+    fs_assumed = 100.0
 
     media_root = Path(getattr(settings, "MEDIA_ROOT", Path(__file__).resolve().parents[1] / "media"))
     job_id = uuid.uuid4().hex
@@ -501,7 +513,7 @@ def _predict_from_3x4_image_bytes(img_bytes: bytes, filename: str = "upload.png"
     out_dir = media_root / "test_out" / "3x4_api" / job_id
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    # 1) Save the image
+    # ============== (A) save src image ==============
     src_path = out_dir / f"src_{Path(filename).stem}.png"
     buf = np.frombuffer(img_bytes, dtype=np.uint8)
     img = cv2.imdecode(buf, cv2.IMREAD_COLOR)
@@ -509,66 +521,97 @@ def _predict_from_3x4_image_bytes(img_bytes: bytes, filename: str = "upload.png"
         raise ValueError("Failed to decode image bytes (not a valid PNG/JPG).")
     cv2.imwrite(str(src_path), img)
 
-    # 2) preprocess 
+    # ============== (B) preprocess_3x4 ==============
     pre_png = out_dir / f"pre_{src_path.stem}.png"
     preprocess_3x4(src_path, pre_png)
 
-    # 3) PNG -> NIfTI  Dataset 504
-    pre_gray = cv2.imread(str(pre_png), cv2.IMREAD_GRAYSCALE)
-    if pre_gray is None:
-        raise ValueError(f"Failed to read preprocessed png: {pre_png}")
+    # ============== (C) nnU-Net (504) ==============
+    pred_nii = run_nnunet(pre_png, dataset_id=dataset_id, is_png=False)
 
-    nii_in = out_dir / f"{pre_png.stem}.nii.gz"
-    vol = pre_gray.astype(np.float32)[None, ...]  # (1,H,W)
-    nib.save(nib.Nifti1Image(vol, affine=np.eye(4)), str(nii_in))
+    if pred_nii.suffixes[-2:] != [".nii", ".gz"]:
+        raise RuntimeError(f"Expected .nii.gz from 504, got: {pred_nii}")
 
-    # 4) run nnU-Net (504) -> pred .nii.gz
-    pred_nii = run_nnunet(nii_in, dataset_id=dataset_id, is_png=False)
+    # ============== (D) nii -> binary mask png ==============
+    mask_png = out_dir / f"mask_504_{src_path.stem}.png"
+    nii_to_png_mask(pred_nii, mask_png, binary=True)
 
-    # 5) pred -> binary mask png
-    arr = nib.load(str(pred_nii)).get_fdata()
-    arr2 = arr[0] if arr.ndim == 3 else arr
-    mask = (arr2 > 0.5).astype(np.uint8) * 255
-
-    mask_png = out_dir / f"mask_{job_id}.png"
-    cv2.imwrite(str(mask_png), mask)
-
-    # 6) digitize 12 leads 
-    leads_mV = digitize_from_binary_mask_3x4(
-        mask_png_path=str(mask_png),
+    # ============== (E) digitize  ==============
+    debug_dir = out_dir / f"debug_digitize_{src_path.stem}"
+    leads_mV, digi_meta = digitize_from_binary_mask_3x4(
+        str(mask_png),
         target_len_samples=target_len,
         px_per_mV=px_per_mV,
+        debug_dir=str(debug_dir),
+        return_meta=True,
     )
 
-    # 7) preprocess
+    # 5) render digitized image
+    like_png = out_dir / "digitized_like_original_3x4.png"
+    plot_like_original_3x4_vis(
+        leads_mV,
+        like_png,
+        cell_w_mm=62.0,
+        cell_h_mm=30.0,
+        row_gap_mm=4.0,
+        col_gap_mm=4.0,
+        auto_gain=True,
+        never_clip=True,
+        headroom=1.10,
+        max_gain_mm_per_mV=7.0,
+        out_width_px=1400,
+    )
+    print("✅ Saved:", like_png)
+
+    # ============== (F) proto preprocess ==============
     X, fs_out = preprocess_single_ecg(
-        leads_mV, fs_in=fs_in_digitizer,
-        fs_target=100, target_len=1000, remove_baseline=True
+        leads_mV,
+        fs_in=int(fs_assumed),
+        fs_target=int(fs_assumed),
+        target_len=target_len,
+        remove_baseline=True,
     )
 
-    # 8) fusion diagnosis
+    # ============== (G) proto predict + topk ==============
     predictor = FusionPredictor.instance()
+
     probs = predictor.predict_from_X(X)
-    labels = predictor.fusion_labels
-    idx = np.argsort(-probs)[:10]
-    topk = [{"label": labels[i], "p": float(probs[i])} for i in idx]
+    probs = np.asarray(probs, dtype=np.float32).reshape(-1)
+
+    labels = list(predictor.fusion_labels)
+
+    idxs = np.argsort(-probs)[:10]
+
+    topk = [
+        {"label": labels[i], "p": float(probs[i])}
+        for i in idxs
+    ]
+
+    if isinstance(digi_meta, dict):
+        for k in ("y_pix_by_lead", "y_path_by_lead", "y_by_lead", "x_by_lead", "points_by_lead"):
+            digi_meta.pop(k, None)
 
     meta = {
         "format": "image_3x4",
         "dataset_id": dataset_id,
         "target_len": target_len,
         "px_per_mV": px_per_mV,
-        "fs_in_digitizer": fs_in_digitizer,
+        "fs_assumed": fs_assumed,
         "fs_out": fs_out,
         "debug_paths": {
+            "out_dir": str(out_dir),
             "src": str(src_path),
             "pre_png": str(pre_png),
-            "nii_in": str(nii_in),
             "pred_nii": str(pred_nii),
             "mask_png": str(mask_png),
+            "debug_digitize": str(debug_dir),
         }
     }
+
+
+
+
     return topk, meta
+
 
 
 
