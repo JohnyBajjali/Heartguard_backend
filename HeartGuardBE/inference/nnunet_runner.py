@@ -118,8 +118,8 @@ def run_nnunet(
 
     # Environment vars: point nnU-Net to your trained models
     env = os.environ.copy()
-    env.setdefault("nnUNet_raw", str(repo_root / "nnUNet_raw_dummy"))
-    env.setdefault("nnUNet_preprocessed", str(repo_root / "nnUNet_preprocessed_dummy"))
+    env["nnUNet_raw"] = str(repo_root / "nnUNet_raw")
+    env["nnUNet_preprocessed"] = str(repo_root / "nnUNet_preprocessed")
     env["nnUNet_results"] = str(_default_nnunet_results_dir())
 
     # Avoid torch.compile complications

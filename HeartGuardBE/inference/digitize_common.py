@@ -81,3 +81,15 @@ def resample_1d(y: np.ndarray, target_len: int) -> np.ndarray:
     x_old = np.linspace(0, 1, num=n, dtype=np.float32)
     x_new = np.linspace(0, 1, num=target_len, dtype=np.float32)
     return np.interp(x_new, x_old, y).astype(np.float32)
+
+
+
+def clean_bin_mask(bin01: np.ndarray, ksize: int = 3, iters: int = 1) -> np.ndarray:
+    """
+    Close small gaps in traces before skeletonize.
+    bin01: uint8 0/1
+    """
+    kernel = np.ones((ksize, ksize), dtype=np.uint8)
+    x = (bin01 > 0).astype(np.uint8) * 255
+    x = cv2.morphologyEx(x, cv2.MORPH_CLOSE, kernel, iterations=iters)
+    return (x > 0).astype(np.uint8)
