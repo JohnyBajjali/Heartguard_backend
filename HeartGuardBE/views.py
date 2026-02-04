@@ -67,10 +67,6 @@ def _auto_crop_ecg_bytes(image_bytes: bytes) -> bytes:
     3) Remove ONLY bottom footer titles band (small % so rhythm strip is kept)
     4) Trim borders safely using edge projections (top/bottom + left/right)
     5) Return JPEG bytes
-
-    Target result:
-    - No bottom titles (speed/gain/filter/id)
-    - Keep full 12-lead + rhythm strip
     """
     import numpy as np
     import cv2
@@ -155,7 +151,6 @@ def _auto_crop_ecg_bytes(image_bytes: bytes) -> bytes:
 
     cnts, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     if not cnts:
-        # could not detect paper => return original
         return encode_jpg(img, 92)
 
     c = max(cnts, key=cv2.contourArea)
@@ -177,12 +172,9 @@ def _auto_crop_ecg_bytes(image_bytes: bytes) -> bytes:
     # ---------------------------------------
     # 2) Remove footer titles (FIXED)
     # ---------------------------------------
-    # Your old value 0.25 was cutting the rhythm strip.
-    # Typical footer is around 8–12%.
     footer_ratio = 0.12
     cut_y = int(ph * (1.0 - footer_ratio))
 
-    # safety: keep at least 88% (do not over-cut)
     min_keep = int(ph * 0.88)
     cut_y = max(cut_y, min_keep)
 
@@ -192,15 +184,11 @@ def _auto_crop_ecg_bytes(image_bytes: bytes) -> bytes:
     # -------------------------------------------
     # 3) Trim borders safely (top/bottom + left/right)
     # -------------------------------------------
-    # Top/bottom trimming
-    paper = trim_by_projection(paper, axis=1)
-    # Left/right trimming
-    paper = trim_by_projection(paper, axis=0)
+    paper = trim_by_projection(paper, axis=1)  # top/bottom
+    paper = trim_by_projection(paper, axis=0)  # left/right
 
-    # optional mild contrast (just improves visibility)
     paper = cv2.convertScaleAbs(paper, alpha=1.05, beta=0)
 
-    # final safety
     if paper.shape[0] < 80 or paper.shape[1] < 80:
         return encode_jpg(img, 92)
 
@@ -275,6 +263,51 @@ def patients_list_create(request):
         }, status=201)
 
     return JsonResponse({"error": "Method not allowed"}, status=405)
+
+
+@csrf_exempt
+def patient_delete(request):
+    """
+    POST /api/patients/delete/
+    Body JSON: {"patient_id": 123}
+    Deletes patient + deletes ECGUpload rows referenced in patient.ecg_upload_ids.
+    Also deletes ECG files (best-effort).
+    """
+    if request.method != "POST":
+        return JsonResponse({"error": "POST required"}, status=405)
+
+    try:
+        data = json.loads(request.body.decode("utf-8"))
+    except Exception:
+        return JsonResponse({"error": "Invalid JSON body"}, status=400)
+
+    patient_id_raw = str(data.get("patient_id", "")).strip()
+    if not patient_id_raw:
+        return JsonResponse({"error": "patient_id is required"}, status=400)
+    if not patient_id_raw.isdigit():
+        return JsonResponse({"error": "patient_id must be an integer"}, status=400)
+
+    patient_id = int(patient_id_raw)
+
+    try:
+        patient = Patient.objects.get(patient_id=patient_id)
+    except Patient.DoesNotExist:
+        return JsonResponse({"error": "patient not found"}, status=404)
+
+    # delete all ECG uploads linked to this patient
+    ids = list(patient.ecg_upload_ids or [])
+    if ids:
+        ecgs = ECGUpload.objects.filter(id__in=ids)
+        # best-effort: delete files from storage
+        for e in ecgs:
+            try:
+                e.file.delete(save=False)
+            except Exception:
+                pass
+        ecgs.delete()
+
+    patient.delete()
+    return JsonResponse({"ok": True, "deleted_patient_id": patient_id}, status=200)
 
 
 @csrf_exempt
@@ -467,6 +500,7 @@ def list_ecgs_for_patient(request):
         safe=False,
         status=200,
     )
+
 
 def detect_ecg_format(file_bytes: bytes) -> str:
     # 1) try xml (philips/aecg)

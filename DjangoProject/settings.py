@@ -8,8 +8,9 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 SECRET_KEY = os.environ.get("DJ_SECRET_KEY", "dev-secret-key-change-me")
 DEBUG = True
 
-ALLOWED_HOSTS = ["*",]  # dev only; lock down in prod
+ALLOWED_HOSTS = ["*"]  # dev only; lock down in prod
 
+# ────────── nnU-Net paths/config ──────────
 NNUNET_RESULTS_DIR = str(Path(BASE_DIR) / "HeartGuardBE" / "nnUNet_results")
 NNUNET_CHECKPOINT = "checkpoint_best.pth"
 NNUNET_CFG = "2d"
@@ -18,7 +19,7 @@ NNUNET_DATASET_3X4PLUS1 = "503"   # your Dataset503...
 NNUNET_DATASET_3X4 = "504"        # your Dataset504...
 NNUNET_FOLDS = ["0", "1", "2", "3", "4"]
 
-
+# ────────── Apps ──────────
 INSTALLED_APPS = [
     # Jazzmin admin theme (must be before django.contrib.admin)
     "jazzmin",
@@ -40,6 +41,7 @@ INSTALLED_APPS = [
     "HeartGuardBE",
 ]
 
+# ────────── Middleware ──────────
 MIDDLEWARE = [
     "corsheaders.middleware.CorsMiddleware",  # must be high
     "django.middleware.security.SecurityMiddleware",
@@ -71,19 +73,22 @@ TEMPLATES = [
 
 WSGI_APPLICATION = "DjangoProject.wsgi.application"
 
-# DATABASES: keep your existing config or env vars
-# Example SQLite for dev:
+# ────────── DATABASE (PostgreSQL) ──────────
+# You can hardcode values for dev, or use env vars.
+# Recommended: use env vars so you don't commit passwords.
 
-# DATABASE (SQLite for local development) 
 DATABASES = {
     "default": {
-        "ENGINE": "django.db.backends.sqlite3",
-        "NAME": BASE_DIR / "db.sqlite3",
+        "ENGINE": "django.db.backends.postgresql",
+        "NAME": os.environ.get("PG_DB", "heartguard"),
+        "USER": os.environ.get("PG_USER", "heartguard_user"),
+        "PASSWORD": os.environ.get("PG_PASSWORD", "123123123"),
+        "HOST": os.environ.get("PG_HOST", "127.0.0.1"),
+        "PORT": os.environ.get("PG_PORT", "5432"),
     }
 }
 
-
-
+# ────────── Password validators ──────────
 AUTH_PASSWORD_VALIDATORS = [
     {"NAME": "django.contrib.auth.password_validation.UserAttributeSimilarityValidator"},
     {"NAME": "django.contrib.auth.password_validation.MinimumLengthValidator"},
@@ -91,11 +96,13 @@ AUTH_PASSWORD_VALIDATORS = [
     {"NAME": "django.contrib.auth.password_validation.NumericPasswordValidator"},
 ]
 
+# ────────── i18n ──────────
 LANGUAGE_CODE = "en-us"
 TIME_ZONE = "UTC"
 USE_I18N = True
 USE_TZ = True
 
+# ────────── Static ──────────
 STATIC_URL = "static/"
 STATIC_ROOT = BASE_DIR / "staticfiles"
 
@@ -113,7 +120,7 @@ REST_FRAMEWORK = {
     "PAGE_SIZE": 25,
 }
 
-from rest_framework.settings import api_settings  # noqa
+from rest_framework.settings import api_settings  # noqa: F401
 
 SIMPLE_JWT = {
     "ACCESS_TOKEN_LIFETIME": timedelta(minutes=30),
@@ -131,5 +138,6 @@ CSRF_TRUSTED_ORIGINS = [
     "http://192.168.0.0:8000",  # adjust/LAN if needed
 ]
 
-MEDIA_URL = '/media/'
-MEDIA_ROOT = BASE_DIR / 'media'
+# ────────── Media ──────────
+MEDIA_URL = "/media/"
+MEDIA_ROOT = BASE_DIR / "media"
