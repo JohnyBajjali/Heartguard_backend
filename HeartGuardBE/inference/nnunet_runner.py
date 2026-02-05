@@ -133,6 +133,7 @@ def run_nnunet(
         "-c", "2d",
         "-f", *folds,
         "-chk", checkpoint,
+        "-device", "cpu",   # ✅ ADD THIS
     ]
 
     print("=== Running nnU-Net ===")
