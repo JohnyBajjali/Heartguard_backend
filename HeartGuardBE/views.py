@@ -72,18 +72,22 @@ def _patient_ecgs_from_ids(patient: Patient):
         ecg = by_id.get(eid)
         if not ecg:
             continue
+
         out.append({
             "id": ecg.id,
             "imageUrl": ecg.file.url,
             "uploaded_at": ecg.uploaded_at.isoformat(),
+
+            # ✅ upload type: xml / aecg / image_3x4 / image_3x4+1
+            "source_type": ecg.source_type,
 
             "prediction_topk": ecg.prediction_topk,
             "prediction_meta": ecg.prediction_meta,
             "predicted_at": ecg.predicted_at.isoformat() if ecg.predicted_at else None,
             "preview_image_url": ecg.preview_image_url,
         })
-    return out
 
+    return out
 
 # ===========================
 # AUTO CROP (OpenCV)
@@ -219,6 +223,7 @@ def _make_preview_for_xml(
         print("⚠️ XML preview generation failed:", e)
         return None, None
 
+
 def _make_preview_for_aecg(leads_mV, fs, *, base_stem: str, request=None):
     """
     Create preview PNG for aECG.
@@ -249,7 +254,6 @@ def _make_preview_for_aecg(leads_mV, fs, *, base_stem: str, request=None):
 
         if x.shape[0] != 12:
             print("⚠️ aECG preview: expected 12 leads, got shape:", x.shape)
-            # still plot what exists
         n_leads = x.shape[0]
         n = x.shape[1]
 
@@ -260,7 +264,7 @@ def _make_preview_for_aecg(leads_mV, fs, *, base_stem: str, request=None):
 
         t = np.arange(n) / float(fs)
 
-        lead_names = ["I","II","III","aVR","aVL","aVF","V1","V2","V3","V4","V5","V6"]
+        lead_names = ["I", "II", "III", "aVR", "aVL", "aVF", "V1", "V2", "V3", "V4", "V5", "V6"]
         lead_names = lead_names[:n_leads]
 
         fig_h = max(6, n_leads * 1.0)
@@ -269,8 +273,10 @@ def _make_preview_for_aecg(leads_mV, fs, *, base_stem: str, request=None):
         for i in range(n_leads):
             ax = plt.subplot(n_leads, 1, i + 1)
             ax.plot(t, x[i], linewidth=0.9)
-            ax.set_ylabel(lead_names[i] if i < len(lead_names) else f"L{i+1}",
-                          rotation=0, labelpad=18, fontsize=9)
+            ax.set_ylabel(
+                lead_names[i] if i < len(lead_names) else f"L{i+1}",
+                rotation=0, labelpad=18, fontsize=9
+            )
             ax.grid(True, alpha=0.25)
             if i != n_leads - 1:
                 ax.set_xticks([])
@@ -290,6 +296,7 @@ def _make_preview_for_aecg(leads_mV, fs, *, base_stem: str, request=None):
     except Exception as e:
         print("⚠️ aECG preview generation failed:", e)
         return None, None
+
 
 # ===========================
 # Detect ECG format
@@ -424,14 +431,13 @@ def _predict_from_3x4_image_bytes(
     # -------------------------
     meta = {
         "format": "image",
-        "layout": layout,  # "3x4" or "3x4+1" (stored even if pipeline same now)
+        "layout": layout,
         "dataset_id": dataset_id,
         "target_len": target_len,
         "px_per_mV": px_per_mV,
         "fs_assumed": fs_assumed,
         "fs_out": fs_out,
 
-        # ✅ Option A additions (so predict_ecg can build URL)
         "job_id": job_id,
         "digitized_path": str(like_png),
 
@@ -447,6 +453,7 @@ def _predict_from_3x4_image_bytes(
     }
 
     return topk, meta
+
 
 # ===========================
 # API ENDPOINTS
@@ -626,6 +633,9 @@ def ecg_upload(request):
     patient_id_raw = (request.POST.get("patient_id", "") or "").strip()
     patient_name = (request.POST.get("patient_name", "") or "").strip()
 
+    # ✅ NEW: layout used for image uploads (3x4 / 3x4+1)
+    layout = (request.POST.get("layout", "") or "").strip()
+
     if not uploaded_file:
         return JsonResponse({"error": "No file uploaded"}, status=400)
     if not patient_name:
@@ -658,9 +668,20 @@ def ecg_upload(request):
 
     file_bytes = uploaded_file.read()
 
+    # ✅ NEW: decide source_type
+    if ext == ".xml":
+        source_type = "xml"
+    
+    elif ext == ".aecg":
+        source_type = "aecg"
+    
+    else:
+        source_type = "image_3x4+1" if layout == "3x4+1" else "image_3x4"
+
     ecg = ECGUpload.objects.create(
         file=ContentFile(file_bytes, name=new_filename),
         source=source,
+        source_type=source_type,  # ✅ NEW
     )
 
     ids = list(patient.ecg_upload_ids or [])
@@ -685,13 +706,16 @@ def ecg_upload(request):
         "url": request.build_absolute_uri(ecg.file.url),
         "filename": new_filename,
         "source": ecg.source,
+
+        # ✅ NEW
+        "source_type": getattr(ecg, "source_type", None),
+
         "uploaded_at": ecg.uploaded_at.isoformat(),
         "patient_id": patient.patient_id,
         "patient_name": patient.full_name,
         "preview_image_url": preview_url,
         "preview_meta": preview_meta,
     }, status=201)
-
 
 @csrf_exempt
 def ecg_auto_crop(request):
@@ -731,21 +755,28 @@ def list_ecgs_for_patient(request):
 
     ecgs = _patient_ecgs_from_ids(patient)
 
-    return JsonResponse([
-        {
-            "id": e["id"],
-            "patient_id": patient.patient_id,
-            "patient_name": patient.full_name,
-            "url": request.build_absolute_uri(e["imageUrl"]),
-            "uploaded_at": e["uploaded_at"],
+    return JsonResponse(
+        [
+            {
+                "id": e["id"],
+                "patient_id": patient.patient_id,
+                "patient_name": patient.full_name,
+                "url": request.build_absolute_uri(e["imageUrl"]),
+                "uploaded_at": e["uploaded_at"],
 
-            "prediction_topk": e.get("prediction_topk"),
-            "prediction_meta": e.get("prediction_meta"),
-            "predicted_at": e.get("predicted_at"),
-            "preview_image_url": e.get("preview_image_url"),
-        }
-        for e in ecgs
-    ], safe=False, status=200)
+                # ✅ upload type shown in Flutter
+                "source_type": e["source_type"],
+
+                "prediction_topk": e["prediction_topk"],
+                "prediction_meta": e["prediction_meta"],
+                "predicted_at": e["predicted_at"],
+                "preview_image_url": e["preview_image_url"],
+            }
+            for e in ecgs
+        ],
+        safe=False,
+        status=200,
+    )
 
 def _save_preview_png(leads_mV: dict, fs: float, fmt: str, filename_stem: str, file_bytes: bytes) -> dict:
     media_root = Path(getattr(settings, "MEDIA_ROOT", Path.cwd() / "media"))
@@ -783,6 +814,7 @@ def _save_preview_png(leads_mV: dict, fs: float, fmt: str, filename_stem: str, f
         url = settings.MEDIA_URL.rstrip("/") + "/" + rel_path
 
     return {"preview_relpath": rel_path, "preview_url": url, "job_id": job_id}
+
 
 @csrf_exempt
 def predict_ecg(request):
@@ -851,6 +883,9 @@ def predict_ecg(request):
             }
 
             if ecg_obj:
+                # ✅ NEW
+                ecg_obj.source_type = "xml"
+
                 ecg_obj.prediction_topk = resp["topk"]
                 ecg_obj.prediction_meta = resp["meta"]
                 ecg_obj.predicted_at = timezone.now()
@@ -858,11 +893,11 @@ def predict_ecg(request):
                 if preview_url:
                     ecg_obj.preview_image_url = preview_url
                     ecg_obj.save(update_fields=[
-                        "prediction_topk", "prediction_meta", "predicted_at", "preview_image_url"
+                        "source_type", "prediction_topk", "prediction_meta", "predicted_at", "preview_image_url"
                     ])
                 else:
                     ecg_obj.save(update_fields=[
-                        "prediction_topk", "prediction_meta", "predicted_at"
+                        "source_type", "prediction_topk", "prediction_meta", "predicted_at"
                     ])
 
             return JsonResponse(resp, status=200)
@@ -887,15 +922,14 @@ def predict_ecg(request):
             idx = np.argsort(-probs)[:10]
             out = [{"label": labels[i], "p": float(probs[i])} for i in idx]
 
-            # ✅ aECG preview (same structure as XML)
             preview = _save_preview_png(
                 leads_mV=leads_mV,
                 fs=fs,
                 fmt="aecg",
                 filename_stem=Path(getattr(up, "name", "upload.aecg")).stem,
                 file_bytes=file_bytes,
-                )
-            
+            )
+
             preview_url = preview.get("preview_url")
             if preview_url and request is not None:
                 preview_url = request.build_absolute_uri(preview_url)
@@ -907,12 +941,14 @@ def predict_ecg(request):
                     "fs_in": fs,
                     "fs_out": fs_out,
                     "aecg_meta": meta,
-                    **preview,   # <- adds preview_url, preview_relpath, job_id
-                    },
+                    **preview,
+                },
             }
 
-
             if ecg_obj:
+                # ✅ NEW
+                ecg_obj.source_type = "aecg"
+
                 ecg_obj.prediction_topk = resp["topk"]
                 ecg_obj.prediction_meta = resp["meta"]
                 ecg_obj.predicted_at = timezone.now()
@@ -920,11 +956,11 @@ def predict_ecg(request):
                 if preview_url:
                     ecg_obj.preview_image_url = preview_url
                     ecg_obj.save(update_fields=[
-                        "prediction_topk", "prediction_meta", "predicted_at", "preview_image_url"
+                        "source_type", "prediction_topk", "prediction_meta", "predicted_at", "preview_image_url"
                     ])
                 else:
                     ecg_obj.save(update_fields=[
-                        "prediction_topk", "prediction_meta", "predicted_at"
+                        "source_type", "prediction_topk", "prediction_meta", "predicted_at"
                     ])
 
                     print("RESP KEYS:", resp.keys())
@@ -944,8 +980,12 @@ def predict_ecg(request):
 
             resp = {"topk": topk, "meta": meta}
 
+            # ✅ update type in DB when predicting
+            if ecg_obj:
+                ecg_obj.source_type = "image_3x4+1" if used_layout == "3x4+1" else "image_3x4"
+
             # -------------------------
-            # ✅ 1) ORIGINAL uploaded image (support different field names)
+            # 1) ORIGINAL uploaded image URL
             # -------------------------
             if ecg_obj:
                 f = (
@@ -958,11 +998,10 @@ def predict_ecg(request):
                     resp["original_image_url"] = request.build_absolute_uri(f.url)
 
             # -------------------------
-            # ✅ 2) DIGITIZED image URL
+            # 2) DIGITIZED image URL
             # -------------------------
             digitized_fs_path = None
 
-            # Try direct path in meta (if exists)
             if isinstance(meta, dict):
                 digitized_fs_path = (
                     meta.get("digitized_path")
@@ -971,7 +1010,6 @@ def predict_ecg(request):
                     or meta.get("digitized_like_original_path")
                 )
 
-                # If meta has job_id, build expected path
                 job_id = meta.get("job_id") or meta.get("run_id") or meta.get("uid")
                 if not digitized_fs_path and job_id:
                     digitized_fs_path = os.path.join(
@@ -982,28 +1020,45 @@ def predict_ecg(request):
                         "digitized_like_original_3x4.png",
                     )
 
-            # Convert filesystem path -> /media/... URL
+            digitized_abs = None
             if digitized_fs_path and os.path.exists(digitized_fs_path):
                 rel = os.path.relpath(digitized_fs_path, settings.MEDIA_ROOT).replace("\\", "/")
                 digitized_url = settings.MEDIA_URL.rstrip("/") + "/" + rel
-                resp["digitized_image_url"] = request.build_absolute_uri(digitized_url)
+                digitized_abs = request.build_absolute_uri(digitized_url)
+                resp["digitized_image_url"] = digitized_abs
 
-            # ✅ DEBUG (do once)
+                # ✅ IMPORTANT FIX:
+                # Save digitized image so it appears later in /api/ecg/list/
+                if ecg_obj:
+                    ecg_obj.preview_image_url = digitized_abs
+
+            # ✅ DEBUG
             print("RESP_KEYS:", resp.keys())
             print("ORIGINAL_URL:", resp.get("original_image_url"))
             print("DIGITIZED_URL:", resp.get("digitized_image_url"))
 
+            # -------------------------
+            # Save prediction to DB
+            # -------------------------
             if ecg_obj:
                 ecg_obj.prediction_topk = topk
                 ecg_obj.prediction_meta = meta
                 ecg_obj.predicted_at = timezone.now()
-                ecg_obj.save(update_fields=["prediction_topk", "prediction_meta", "predicted_at"])
+
+                ecg_obj.save(update_fields=[
+                    "source_type",
+                    "prediction_topk",
+                    "prediction_meta",
+                    "predicted_at",
+                    "preview_image_url",   # ✅ include this!
+                ])
 
             return JsonResponse(resp, status=200)
 
     except Exception as e:
         return JsonResponse({"error": str(e), "format": fmt}, status=500)
-    
+
+
 def patient_notes(request, patient_id):
     pid_raw = str(patient_id).strip()
     if not pid_raw.isdigit():

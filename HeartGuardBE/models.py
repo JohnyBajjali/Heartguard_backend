@@ -171,8 +171,24 @@ class ECGUpload(models.Model):
     Stores prediction results so patient history can show it.
     """
 
+    class SourceType(models.TextChoices):
+        XML = "xml", "XML"
+        AECG = "aecg", "aECG"
+        IMAGE_3X4 = "image_3x4", "3x4 Image"
+        IMAGE_3X4P1 = "image_3x4+1", "3x4+1 Image"
+
     file = models.ImageField(upload_to="ecg_uploads/")
     source = models.CharField(max_length=50, default="mobile")
+
+    # ✅ upload type (xml / aecg / image_3x4 / image_3x4+1)
+    source_type = models.CharField(
+        max_length=32,  # ✅ changed from 20 -> 32
+        choices=SourceType.choices,
+        null=True,      # ✅ recommended
+        blank=True,     # ✅ recommended
+        default=SourceType.IMAGE_3X4,
+    )
+
     uploaded_at = models.DateTimeField(auto_now_add=True)
 
     # Saved prediction output

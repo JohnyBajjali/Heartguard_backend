@@ -2,8 +2,11 @@ from __future__ import annotations
 
 from pathlib import Path
 import json
+from typing import Tuple, Optional
+
 import numpy as np
 import cv2
+
 
 STD_LEADS = ["I","II","III","aVR","aVL","aVF","V1","V2","V3","V4","V5","V6"]
 
@@ -13,8 +16,99 @@ LEAD_LAYOUT_3x4 = [
     "III","aVF", "V3", "V6",
 ]
 
+
+def hampel_filter_1d(x: np.ndarray, window: int = 7, n_sigmas: float = 3.0) -> np.ndarray:
+    """
+    Hampel filter for outlier removal. Keeps morphology better than median-only smoothing.
+    window: odd number, typical 7..21
+    """
+    x = np.asarray(x, dtype=np.float32)
+    n = x.size
+    if n < 3:
+        return x.copy()
+
+    w = int(window) | 1
+    k = w // 2
+
+    y = x.copy()
+    # scale factor for MAD->sigma for normal dist
+    c = 1.4826
+
+    for i in range(n):
+        a = max(0, i - k)
+        b = min(n, i + k + 1)
+        med = np.median(x[a:b])
+        mad = c * np.median(np.abs(x[a:b] - med))
+        if mad < 1e-12:
+            continue
+        if np.abs(x[i] - med) > n_sigmas * mad:
+            y[i] = med
+    return y
+
+
+def savgol_smooth_1d(x: np.ndarray, window: int = 11, poly: int = 3) -> np.ndarray:
+    """
+    Savitzky–Golay smoothing via local polynomial least squares (no SciPy).
+    window: odd number (9..21 typical). poly: 2 or 3.
+    Preserves QRS shape better than moving average.
+    """
+    x = np.asarray(x, dtype=np.float32)
+    n = x.size
+    if n < 5:
+        return x.copy()
+
+    w = int(window) | 1
+    w = min(w, n if n % 2 == 1 else n - 1)
+    if w < 5:
+        return x.copy()
+
+    poly = int(poly)
+    poly = max(1, min(poly, w - 2))
+    half = w // 2
+
+    # Build Vandermonde for positions [-half..half]
+    t = np.arange(-half, half + 1, dtype=np.float32)
+    A = np.vstack([t**p for p in range(poly + 1)]).T  # (w, poly+1)
+
+    # Compute convolution coeffs for smoothing (evaluate at t=0)
+    # Coeffs = e0^T (A^+), where e0 selects constant term at t=0
+    pinv = np.linalg.pinv(A)  # (poly+1, w)
+    coeff = pinv[0].astype(np.float32)  # weights for y(0)
+
+    # Pad edge with reflection to avoid edge shrink
+    xpad = np.pad(x, (half, half), mode="reflect")
+    y = np.convolve(xpad, coeff[::-1], mode="valid").astype(np.float32)
+    return y
+
+
+def smooth_ecg_lead_mV(
+    y: np.ndarray,
+    *,
+    hampel_window: int = 7,
+    hampel_sigmas: float = 3.0,
+    sg_window: int = 11,
+    sg_poly: int = 3,
+    blend: float = 1.0,
+) -> np.ndarray:
+    """
+    Safe smoothing pipeline:
+      - Hampel removes tiny digitization glitches
+      - SavGol lightly smooths while preserving morphology
+    blend: 0..1, how much smoothed replaces original (1=full smoothed)
+    """
+    y = np.asarray(y, dtype=np.float32)
+    if y.size < 5:
+        return y.copy()
+
+    y1 = hampel_filter_1d(y, window=hampel_window, n_sigmas=hampel_sigmas)
+    y2 = savgol_smooth_1d(y1, window=sg_window, poly=sg_poly)
+
+    blend = float(np.clip(blend, 0.0, 1.0))
+    return (1.0 - blend) * y + blend * y2
+
+
 # -------------------------------
-# IO + utilities
+# IO + basic helpers
 # -------------------------------
 def load_mask_u8(p: str) -> np.ndarray:
     m = cv2.imread(p, cv2.IMREAD_UNCHANGED)
@@ -31,11 +125,11 @@ def clean_bin_mask(
     bin01: np.ndarray,
     ksize: int = 3,
     iters_close: int = 1,
-    do_open: bool = False,   # ✅ IMPORTANT: default OFF to avoid shaving QRS tips
+    do_open: bool = False,   # IMPORTANT: keep OFF by default
 ) -> np.ndarray:
     """
-    CLOSE fills tiny gaps in the trace.
-    OPEN can erase thin spike tips -> keep OFF unless your mask is very noisy.
+    CLOSE fills tiny gaps.
+    OPEN can shave QRS tips -> default OFF.
     """
     k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (ksize, ksize))
     x = (bin01 > 0).astype(np.uint8) * 255
@@ -45,31 +139,9 @@ def clean_bin_mask(
     return (x > 0).astype(np.uint8)
 
 
-def resample_1d(y: np.ndarray, target_len: int) -> np.ndarray:
-    y = np.asarray(y, dtype=np.float32)
-    if len(y) == target_len:
-        return y
-    x_old = np.linspace(0.0, 1.0, num=len(y), dtype=np.float32)
-    x_new = np.linspace(0.0, 1.0, num=target_len, dtype=np.float32)
-    return np.interp(x_new, x_old, y).astype(np.float32)
-
-
-def fill_nans_linear(y: np.ndarray) -> np.ndarray:
-    y = y.astype(np.float32)
-    n = len(y)
-    x = np.arange(n, dtype=np.float32)
-    good = np.isfinite(y)
-    if good.sum() == 0:
-        return np.zeros((n,), dtype=np.float32)
-    if good.sum() == 1:
-        y[:] = y[good][0]
-        return y
-    y[~good] = np.interp(x[~good], x[good], y[good]).astype(np.float32)
-    return y
-
-
-def ypix_to_mV(y_pix: np.ndarray, baseline_pix: float, px_per_mV: float) -> np.ndarray:
-    # up = positive (image y grows downward)
+def pixel_y_to_mV(y_pix: np.ndarray, px_per_mV: float, baseline_pix: float) -> np.ndarray:
+    # ECG convention: up is positive, image y grows downward
+    y_pix = np.asarray(y_pix, np.float32)
     return ((baseline_pix - y_pix) / float(px_per_mV)).astype(np.float32)
 
 
@@ -106,18 +178,13 @@ def _search_min(profile: np.ndarray, center: int, halfwin: int) -> int:
 
 
 # -------------------------------
-# Stable split (bbox + constrained minima)
+# Stable split: 3 rows x 4 cols
 # -------------------------------
 def split_mask_into_cells_3x4(
     bin01: np.ndarray,
-    pad_x: int = 0,   # ✅ default 0 so we don't cut V3/V2 tips
-    pad_y: int = 0,   # ✅ default 0 so we don't cut bottom spikes
+    pad_x: int = 0,   # default 0: don't cut tips
+    pad_y: int = 0,   # default 0: don't cut tips
 ) -> tuple[list[tuple[int,int,int,int]], list[int], list[int]]:
-    """
-    Returns:
-      boxes: 12 boxes (y1,y2,x1,x2) row-major in FULL image coords
-      h_seps, v_seps in CROPPED coords (debug)
-    """
     cropped, (Y1, Y2, X1, X2) = _crop_to_foreground(bin01, margin_frac=0.01)
     H, W = cropped.shape
 
@@ -133,11 +200,8 @@ def split_mask_into_cells_3x4(
     v_halfwin = max(10, int(W * 0.08))
     h_halfwin = max(10, int(H * 0.10))
 
-    v_seps = [_search_min(col_s, t, v_halfwin) for t in v_targets]
-    h_seps = [_search_min(row_s, t, h_halfwin) for t in h_targets]
-
-    v_seps = sorted(list(dict.fromkeys(v_seps)))
-    h_seps = sorted(list(dict.fromkeys(h_seps)))
+    v_seps = sorted({_search_min(col_s, t, v_halfwin) for t in v_targets})
+    h_seps = sorted({_search_min(row_s, t, h_halfwin) for t in h_targets})
 
     if len(v_seps) != 3:
         v_seps = [int(W*0.25), int(W*0.50), int(W*0.75)]
@@ -153,7 +217,6 @@ def split_mask_into_cells_3x4(
             x1, x2 = xs[c], xs[c+1]
             y1, y2 = ys[r], ys[r+1]
 
-            # shrink a little if you want, but default is 0 (no shrink)
             x1 = min(max(0, x1 + pad_x), W - 2)
             x2 = min(max(x1 + 1, x2 - pad_x), W)
             y1 = min(max(0, y1 + pad_y), H - 2)
@@ -165,150 +228,171 @@ def split_mask_into_cells_3x4(
 
 
 # -------------------------------
-# Baseline + spike-aware trace extraction
+# Baseline + trace extraction
 # -------------------------------
-def _baseline_mode_from_rows(roi01: np.ndarray, band=(0.25, 0.75)) -> float:
-    """
-    Baseline from row-histogram peak, but restricted to the middle band so
-    huge QRS columns don't hijack the mode.
-    """
+def baseline_mode_from_rows(roi01: np.ndarray, band=(0.25, 0.75)) -> float:
     H = roi01.shape[0]
     row_counts = roi01.sum(axis=1).astype(np.int32)
     if row_counts.max() <= 0:
         return float(H * 0.55)
 
-    a = int(band[0] * H)
-    b = int(band[1] * H)
-    a = max(0, min(H-1, a))
-    b = max(a+1, min(H, b))
+    a = max(0, min(H-1, int(band[0] * H)))
+    b = max(a+1, min(H, int(band[1] * H)))
 
     mid = row_counts[a:b]
     if mid.max() > 0:
         return float(a + int(np.argmax(mid)))
-
     return float(int(np.argmax(row_counts)))
 
 
-def extract_trace_spike_aware(roi01: np.ndarray) -> np.ndarray:
-    """
-    Stronger + more consistent spike handling:
-    - keeps a persistent "side" (above/below baseline) through a spike
-    - prefers extremes in tall columns, not the median
-    """
+def extract_trace_y_from_mask(
+    roi01: np.ndarray,
+    *,
+    baseline_pix: Optional[float] = None,
+    min_pixels_per_col: int = 1,
+    spike_span_frac: float = 0.22,
+) -> Tuple[np.ndarray, np.ndarray]:
+
     H, W = roi01.shape
-    y = np.full((W,), np.nan, dtype=np.float32)
+    xs: list[int] = []
+    ys: list[float] = []
 
-    col_counts = roi01.sum(axis=0).astype(np.int32)
-    bad_cols = col_counts >= int(0.90 * H)  # stricter; ignore huge vertical junk
-
-    baseline_est = _baseline_mode_from_rows(roi01)
+    if baseline_pix is None:
+        row_counts = roi01.sum(axis=1).astype(np.int32)
+        if row_counts.max() <= 0:
+            baseline_pix = float(H * 0.55)
+        else:
+            a = max(0, min(H - 1, int(0.25 * H)))
+            b = max(a + 1, min(H, int(0.75 * H)))
+            mid = row_counts[a:b]
+            baseline_pix = float(a + int(np.argmax(mid))) if mid.max() > 0 else float(int(np.argmax(row_counts)))
 
     prev_y = np.nan
     prev_dy = 0.0
+    side = 0  # -1 above baseline, +1 below baseline
 
-    # persistent side state: -1 means above baseline, +1 below baseline
-    side = 0
-
-    # centroid for trend hint
-    y_cent = np.full((W,), np.nan, dtype=np.float32)
-    for x in range(W):
-        ys = np.where(roi01[:, x] > 0)[0]
-        if ys.size:
-            y_cent[x] = float(np.mean(ys))
+    # --- NEW knobs ---
+    max_jump = 0.40 * H       # cap vertical jump per column
+    alpha_vel = 0.35          # smooth velocity update
+    edge_margin = 0.04 * H    # how far to push off border when clipped
 
     for x in range(W):
-        if bad_cols[x]:
+        rows = np.flatnonzero(roi01[:, x])
+        if rows.size < min_pixels_per_col:
             continue
 
-        ys = np.where(roi01[:, x] > 0)[0]
-        if ys.size == 0:
-            continue
-
-        y_top = float(ys.min())
-        y_bot = float(ys.max())
-        y_med = float(np.median(ys))
+        y_top = float(rows.min())
+        y_bot = float(rows.max())
+        y_med = float(np.median(rows))
         span = y_bot - y_top
 
+        top_touch = (y_top <= 1.0)
+        bot_touch = (y_bot >= H - 2.0)
+
         if not np.isfinite(prev_y):
-            y[x] = y_med
-            prev_y = y[x]
-            prev_dy = 0.0
-            side = -1 if prev_y < baseline_est else +1
-            continue
-
-        dy_hint = None
-        if x + 1 < W and np.isfinite(y_cent[x]) and np.isfinite(y_cent[x + 1]):
-            dy_hint = float(y_cent[x + 1] - y_cent[x])
-
-        # tall column => pick an EXTREME consistently
-        if span >= 0.22 * H:
-            going_up = (dy_hint < 0) if dy_hint is not None else (prev_dy < 0)
-            going_down = (dy_hint > 0) if dy_hint is not None else (prev_dy > 0)
-
-            if going_up:
-                desired = -1
-            elif going_down:
-                desired = +1
-            else:
-                desired = side
-
-            # choose extreme matching desired side:
-            cand = y_top if desired < 0 else y_bot
-
-            # but if previous y is clearly on the other side, don't flip too easily
-            flip_margin = 0.06 * H
-            if desired != side and abs(prev_y - baseline_est) > flip_margin:
-                cand = y_top if side < 0 else y_bot
-
-            y[x] = cand
-            side = -1 if y[x] < baseline_est else +1
-
+            y = y_med
+            side = -1 if y < baseline_pix else +1
         else:
-            # normal column: follow slope while staying near the trace
             pred = prev_y + prev_dy
-            candidates = np.array([y_top, y_med, y_bot], dtype=np.float32)
 
-            # small penalty for jumping between extremes (helps consistency)
-            jump_pen = 0.12 * np.abs(candidates - prev_y)
-            slope_pen = np.abs(candidates - pred)
-            y[x] = float(candidates[int(np.argmin(slope_pen + jump_pen))])
+            if span >= spike_span_frac * H:
+                desired_side = -1 if pred < baseline_pix else +1
+                cand = y_top if desired_side < 0 else y_bot
+                cand_side = -1 if cand < baseline_pix else +1
 
-            side = -1 if y[x] < baseline_est else +1
+                flip_margin = 0.06 * H
+                if cand_side != side and abs(prev_y - baseline_pix) > flip_margin:
+                    cand = y_top if side < 0 else y_bot
 
-        prev_dy = float(y[x] - prev_y)
-        prev_y = float(y[x])
+                # --- NEW: avoid trusting clipped border extremes ---
+                if top_touch and cand == y_top:
+                    cand = min(y_bot, y_top + edge_margin)
+                if bot_touch and cand == y_bot:
+                    cand = max(y_top, y_bot - edge_margin)
 
-    y = fill_nans_linear(y)
+                y = float(cand)
+                side = -1 if y < baseline_pix else +1
+            else:
+                candidates = np.array([y_top, y_med, y_bot], dtype=np.float32)
 
-    # ultra-mild smoothing (keeps spikes)
-    k = 3
-    if W >= k:
-        pad = k // 2
-        ypad = np.pad(y, (pad, pad), mode="edge")
-        y = np.convolve(ypad, np.ones(k, dtype=np.float32) / k, mode="valid").astype(np.float32)
+                # --- NEW: penalize border-touch candidates slightly (reduces clipping lock) ---
+                edge_pen = np.zeros_like(candidates)
+                if top_touch:
+                    edge_pen[0] += 0.35 * H
+                if bot_touch:
+                    edge_pen[2] += 0.35 * H
 
-    return y.astype(np.float32)
+                jump_pen = 0.12 * np.abs(candidates - prev_y)
+                slope_pen = np.abs(candidates - pred)
+
+                y = float(candidates[int(np.argmin(slope_pen + jump_pen + edge_pen))])
+                side = -1 if y < baseline_pix else +1
+
+        # --- NEW: hard jump cap to prevent teleports ---
+        if np.isfinite(prev_y):
+            dy = y - prev_y
+            if abs(dy) > max_jump:
+                y = float(prev_y + np.clip(dy, -max_jump, max_jump))
+
+        xs.append(x)
+        ys.append(y)
+
+        # --- NEW: velocity smoothing ---
+        if np.isfinite(prev_y):
+            inst = float(y - prev_y)
+            prev_dy = (1 - alpha_vel) * prev_dy + alpha_vel * inst
+        prev_y = float(y)
+
+    if not xs:
+        return np.array([], dtype=np.int32), np.array([], dtype=np.float32)
+
+    return np.asarray(xs, np.int32), np.asarray(ys, np.float32)
 
 
-def _mean_pixel_error(roi01: np.ndarray, y: np.ndarray) -> float:
+def resample_y_over_x(xs: np.ndarray, ys: np.ndarray, out_len: int) -> np.ndarray:
+    xs = np.asarray(xs, np.float32)
+    ys = np.asarray(ys, np.float32)
+    if xs.size < 2:
+        return np.zeros((out_len,), dtype=np.float32)
+
+    x0, x1 = float(xs.min()), float(xs.max())
+    x_new = np.linspace(x0, x1, out_len, dtype=np.float32)
+    y_new = np.interp(x_new, xs, ys).astype(np.float32)
+    return y_new
+
+
+# -------------------------------
+# CORRECT metrics (measured on ROI grid, not on resampled array)
+# -------------------------------
+def mean_pixel_error_on_roi(roi01: np.ndarray, xs: np.ndarray, ys: np.ndarray) -> float:
     H, W = roi01.shape
-    y = np.asarray(y, dtype=np.float32)
+    if xs.size == 0:
+        return float("inf")
+
     errs = []
-    for x in range(min(W, y.size)):
-        ys = np.where(roi01[:, x] > 0)[0]
-        if ys.size == 0:
+    for x, y in zip(xs.tolist(), ys.tolist()):
+        x = int(x)
+        if x < 0 or x >= W:
             continue
-        errs.append(float(np.min(np.abs(ys.astype(np.float32) - y[x]))))
+        col = np.flatnonzero(roi01[:, x])
+        if col.size == 0:
+            continue
+        errs.append(float(np.min(np.abs(col.astype(np.float32) - float(y)))))
     return float(np.mean(errs)) if errs else float("inf")
 
 
-def _hit_rate(roi01: np.ndarray, y: np.ndarray) -> float:
+def hit_rate_on_roi(roi01: np.ndarray, xs: np.ndarray, ys: np.ndarray) -> float:
     H, W = roi01.shape
-    y = np.asarray(y, dtype=np.float32)
+    if xs.size == 0:
+        return 0.0
+
     hits = 0
     tot = 0
-    for x in range(min(W, y.size)):
-        yy = int(np.clip(np.rint(y[x]), 0, H - 1))
+    for x, y in zip(xs.tolist(), ys.tolist()):
+        x = int(x)
+        if x < 0 or x >= W:
+            continue
+        yy = int(np.clip(np.rint(y), 0, H - 1))
         tot += 1
         if roi01[yy, x] > 0:
             hits += 1
@@ -335,9 +419,10 @@ def digitize_from_binary_mask_3x4(
     debug_dir: str | None = None,
     return_meta: bool = False,
     *,
-    split_pad_x: int = 0,          # ✅ default no shrink
-    split_pad_y: int = 0,          # ✅ default no shrink
-    clean_do_open: bool = False,   # ✅ default OFF
+    split_pad_x: int = 0,          # keep 0
+    split_pad_y: int = 0,          # keep 0
+    clean_do_open: bool = False,   # keep False
+    prefer: str = "median",
 ):
     mask_u8 = load_mask_u8(mask_png_path)
     bin01 = (mask_u8 > 0).astype(np.uint8)
@@ -354,44 +439,70 @@ def digitize_from_binary_mask_3x4(
     meta = {
         "px_per_mV": float(px_per_mV),
         "target_len": int(target_len_samples),
-        "boxes": {},               # lead -> [y1,y2,x1,x2]
-        "baseline_pix": {},        # lead -> baseline in ROI coords
-        "y_path_pix": {},          # lead -> list length roi_w (ROI coords)
-        "mean_abs_px_err": {},     # lead -> float
-        "hit_rate": {},            # lead -> float (0..1)
+        "boxes": {},          # lead -> [y1,y2,x1,x2]
+        "baseline_pix": {},   # lead -> baseline in ROI coords
+        "xs_pix": {},         # lead -> sparse x samples (ROI coords)
+        "ys_pix": {},         # lead -> sparse y samples (ROI coords)
+        "mean_abs_px_err": {},# lead -> float (computed on xs/ys)
+        "hit_rate": {},       # lead -> float (computed on xs/ys)
     }
 
     for i, (y1, y2, x1, x2) in enumerate(boxes):
         lead = LEAD_LAYOUT_3x4[i]
         roi = bin01[y1:y2, x1:x2].astype(np.uint8)
-
         meta["boxes"][lead] = [int(y1), int(y2), int(x1), int(x2)]
 
         if int(roi.sum()) < 30:
             layout_leads_mV[lead] = np.zeros((target_len_samples,), dtype=np.float32)
             meta["baseline_pix"][lead] = float(roi.shape[0] * 0.55)
-            meta["y_path_pix"][lead] = []
+            meta["xs_pix"][lead] = []
+            meta["ys_pix"][lead] = []
             meta["mean_abs_px_err"][lead] = None
             meta["hit_rate"][lead] = None
             continue
 
-        y_path = extract_trace_spike_aware(roi)  # ROI coords
-        baseline = _baseline_mode_from_rows(roi) # ROI coords
+        baseline = baseline_mode_from_rows(roi)
+        xs, ys = extract_trace_y_from_mask(
+            roi,
+            baseline_pix=baseline,
+            min_pixels_per_col=1,
+            spike_span_frac=0.22,
+        )
 
-        mv = ypix_to_mV(y_path, baseline_pix=baseline, px_per_mV=px_per_mV)
-        mv = resample_1d(mv, target_len_samples).astype(np.float32)
-        layout_leads_mV[lead] = mv
+        if xs.size < 2:
+            layout_leads_mV[lead] = np.zeros((target_len_samples,), dtype=np.float32)
+            meta["baseline_pix"][lead] = float(baseline)
+            meta["xs_pix"][lead] = []
+            meta["ys_pix"][lead] = []
+            meta["mean_abs_px_err"][lead] = None
+            meta["hit_rate"][lead] = None
+            continue
 
+        # resample ONLY for the output signal length
+        y_resampled = resample_y_over_x(xs, ys, out_len=int(target_len_samples))
+        mv = pixel_y_to_mV(y_resampled, px_per_mV=float(px_per_mV), baseline_pix=float(baseline))
+        mv = smooth_ecg_lead_mV(
+            mv,
+            hampel_window=7,
+            hampel_sigmas=3.0,
+            sg_window=11,
+            sg_poly=3,
+            blend=1.0,
+        )
+        layout_leads_mV[lead] = mv.astype(np.float32)
+
+        # store meta + CORRECT metrics on xs/ys
         meta["baseline_pix"][lead] = float(baseline)
-        meta["y_path_pix"][lead] = y_path.astype(np.float32).tolist()
-        meta["mean_abs_px_err"][lead] = float(_mean_pixel_error(roi, y_path))
-        meta["hit_rate"][lead] = float(_hit_rate(roi, y_path))
+        meta["xs_pix"][lead] = xs.astype(int).tolist()
+        meta["ys_pix"][lead] = ys.astype(np.float32).tolist()
+        meta["mean_abs_px_err"][lead] = float(mean_pixel_error_on_roi(roi, xs, ys))
+        meta["hit_rate"][lead] = float(hit_rate_on_roi(roi, xs, ys))
 
         if dbg:
             vis = cv2.cvtColor((roi * 255).astype(np.uint8), cv2.COLOR_GRAY2BGR)
-            y_int = np.clip(np.rint(y_path).astype(int), 0, roi.shape[0] - 1)
-            for xx in range(min(roi.shape[1], y_int.size)):
-                vis[y_int[xx], xx] = (0, 0, 255)
+            for x, y in zip(xs.tolist(), ys.tolist()):
+                yy = int(np.clip(np.rint(y), 0, roi.shape[0]-1))
+                vis[yy, int(x)] = (0, 0, 255)
             cv2.imwrite(str(dbg / f"overlay_{lead}.png"), vis)
 
     leads_mV: dict[str, np.ndarray] = {}
