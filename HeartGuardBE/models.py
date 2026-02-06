@@ -108,6 +108,7 @@ class Patient(TimeStampedModel):
     first_name = models.CharField(max_length=120, blank=True, default="")
     last_name = models.CharField(max_length=120, blank=True, default="")
     date_of_birth = models.DateField(null=True, blank=True)
+    age = models.PositiveSmallIntegerField(null=True, blank=True)
 
     # ✅ make gender optional (better for your UI checkbox)
     gender = models.CharField(

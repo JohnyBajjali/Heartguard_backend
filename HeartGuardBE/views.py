@@ -211,10 +211,12 @@ def patients_list_create(request):
             data.append({
                 "patient_id": p.patient_id,
                 "full_name": p.full_name,
+                "age": p.age,  # ✅ NEW
                 "gender": p.gender,
                 "created_at": p.created_at.isoformat(),
                 "ecg_count": len(p.ecg_upload_ids or []),
-            })
+                })
+
         return JsonResponse({"patients": data}, status=200)
 
     if request.method == "POST":
@@ -226,6 +228,7 @@ def patients_list_create(request):
         patient_id_raw = str(data.get("patient_id", "")).strip()
         full_name = str(data.get("full_name", "")).strip()
         gender = data.get("gender", None)
+        age_raw = data.get("age", None)  # ✅ NEW
 
         if not patient_id_raw:
             return JsonResponse({"error": "patient_id is required"}, status=400)
@@ -240,12 +243,33 @@ def patients_list_create(request):
         if Patient.objects.filter(patient_id=patient_id).exists():
             return JsonResponse({"error": "patient_id already exists"}, status=409)
 
-        if gender not in ("M", "F", None, ""):
-            return JsonResponse({"error": "gender must be 'M' or 'F' (or omitted)"}, status=400)
-        if gender == "":
-            gender = None
+        gender = data.get("gender", None)
+        
+        if gender not in ("M", "F"):
+            return JsonResponse(
+                {"error": "gender is required and must be 'M' or 'F'"},
+                status=400,
+                )
 
-        patient = Patient(patient_id=patient_id, full_name=full_name, gender=gender)
+        if age_raw is None or str(age_raw).strip() == "":
+            return JsonResponse({"error": "age is required"}, status=400)
+        
+        try:
+            age = int(str(age_raw).strip())
+            
+        except Exception:
+            return JsonResponse({"error": "age must be an integer"}, status=400)
+        
+        if age < 1 or age > 130:
+            return JsonResponse({"error": "age must be between 1 and 130"}, status=400)
+
+        patient = Patient(
+            patient_id=patient_id,
+            full_name=full_name,
+            age=age,          # ✅ NEW
+            gender=gender,
+            )
+
         try:
             patient.full_clean()
         except ValidationError as e:
@@ -254,13 +278,13 @@ def patients_list_create(request):
 
         return JsonResponse({
             "patient": {
-                "patient_id": patient.patient_id,
-                "full_name": patient.full_name,
-                "gender": patient.gender,
-                "created_at": patient.created_at.isoformat(),
-                "ecg_count": len(patient.ecg_upload_ids or []),
-            }
-        }, status=201)
+            "patient_id": patient.patient_id,
+            "full_name": patient.full_name,
+            "age": patient.age,  # ✅ ADD THIS LINE
+            "gender": patient.gender,
+            "created_at": patient.created_at.isoformat(),
+            "ecg_count": len(patient.ecg_upload_ids or []),
+            }}, status=201)
 
     return JsonResponse({"error": "Method not allowed"}, status=405)
 
