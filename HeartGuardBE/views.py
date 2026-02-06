@@ -8,6 +8,10 @@ import numpy as np
 import cv2
 from lxml import etree
 
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+
 from django.conf import settings
 from django.core.exceptions import ValidationError
 from django.http import HttpResponse, JsonResponse
@@ -212,6 +216,235 @@ def _make_preview_for_xml(
         print("⚠️ XML preview generation failed:", e)
         return None, None
 
+def _make_preview_for_aecg(leads_mV, fs, *, base_stem: str, request=None):
+    """
+    Create preview PNG for aECG.
+    Works even if leads_mV comes as (N,12) or (1,12,N) etc.
+    Returns (preview_url, preview_meta) or (None, None) if fails.
+    """
+    try:
+        import numpy as np
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+        from django.conf import settings
+
+        # ===== Normalize shape =====
+        x = np.asarray(leads_mV)
+
+        # Squeeze singleton dims: (1,12,N) -> (12,N)
+        if x.ndim >= 3:
+            x = np.squeeze(x)
+
+        if x.ndim != 2:
+            print("⚠️ aECG preview: unexpected ndim/shape:", x.ndim, getattr(x, "shape", None))
+            return None, None
+
+        # Ensure [12, N]
+        if x.shape[0] != 12 and x.shape[1] == 12:
+            x = x.T
+
+        if x.shape[0] != 12:
+            print("⚠️ aECG preview: expected 12 leads, got shape:", x.shape)
+            # still plot what exists
+        n_leads = x.shape[0]
+        n = x.shape[1]
+
+        # ===== Output path =====
+        previews_dir = _media_root() / "ecg_previews"
+        previews_dir.mkdir(parents=True, exist_ok=True)
+        out_png = previews_dir / f"{base_stem}_preview.png"
+
+        t = np.arange(n) / float(fs)
+
+        lead_names = ["I","II","III","aVR","aVL","aVF","V1","V2","V3","V4","V5","V6"]
+        lead_names = lead_names[:n_leads]
+
+        fig_h = max(6, n_leads * 1.0)
+        plt.figure(figsize=(14, fig_h))
+
+        for i in range(n_leads):
+            ax = plt.subplot(n_leads, 1, i + 1)
+            ax.plot(t, x[i], linewidth=0.9)
+            ax.set_ylabel(lead_names[i] if i < len(lead_names) else f"L{i+1}",
+                          rotation=0, labelpad=18, fontsize=9)
+            ax.grid(True, alpha=0.25)
+            if i != n_leads - 1:
+                ax.set_xticks([])
+            else:
+                ax.set_xlabel("Time (s)")
+
+        plt.tight_layout()
+        plt.savefig(out_png, dpi=160)
+        plt.close()
+
+        # Return relative URL so Flutter can prefix base URL
+        rel_url = f"{settings.MEDIA_URL.rstrip('/')}/ecg_previews/{out_png.name}"
+        meta = {"fs": float(fs), "n_leads": int(n_leads), "n_samples": int(n), "shape": list(x.shape)}
+
+        return rel_url, meta
+
+    except Exception as e:
+        print("⚠️ aECG preview generation failed:", e)
+        return None, None
+
+def _make_preview_from_X(X, fs, *, base_stem: str, style: str = "3x4+rhythm"):
+    """
+    Create preview PNG from numeric X (output of preprocess_single_ecg).
+    style:
+      - "stacked": 12 stacked leads
+      - "3x4+rhythm": ECG paper style (3x4) + rhythm strip (lead II)
+    Returns (relative_url, meta) or (None, None).
+    """
+    try:
+        import numpy as np
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+        from django.conf import settings
+
+        x = np.asarray(X)
+        x = np.squeeze(x)
+
+        if x.ndim != 2:
+            print("⚠️ preview_from_X: unexpected shape:", getattr(x, "shape", None))
+            return None, None
+
+        # ensure [12, N]
+        if x.shape[0] != 12 and x.shape[1] == 12:
+            x = x.T
+
+        if x.shape[0] < 1:
+            print("⚠️ preview_from_X: empty leads")
+            return None, None
+
+        n_leads = x.shape[0]
+        n = x.shape[1]
+
+        previews_dir = _media_root() / "ecg_previews"
+        previews_dir.mkdir(parents=True, exist_ok=True)
+        out_png = previews_dir / f"{base_stem}_preview.png"
+
+        lead_names = ["I","II","III","aVR","aVL","aVF","V1","V2","V3","V4","V5","V6"]
+        lead_names = lead_names[:n_leads]
+
+        # Helper: "ECG paper" grid
+        def _ecg_grid(ax, seconds_span, mv_span):
+            # small squares: 0.04s, 0.1mV
+            ax.set_xlim(0, seconds_span)
+            ax.set_ylim(-mv_span, mv_span)
+
+            # major squares: 0.2s, 0.5mV
+            ax.set_xticks(np.arange(0, seconds_span + 1e-9, 0.2))
+            ax.set_xticks(np.arange(0, seconds_span + 1e-9, 0.04), minor=True)
+
+            ax.set_yticks(np.arange(-mv_span, mv_span + 1e-9, 0.5))
+            ax.set_yticks(np.arange(-mv_span, mv_span + 1e-9, 0.1), minor=True)
+
+            ax.grid(which="major", alpha=0.25, linewidth=0.8)
+            ax.grid(which="minor", alpha=0.10, linewidth=0.5)
+
+            ax.tick_params(which="both", length=0)
+            ax.set_xticklabels([])
+            ax.set_yticklabels([])
+
+        # ===== Choose output style =====
+        if style == "stacked":
+            t = np.arange(n) / float(fs)
+            fig_h = max(6, n_leads * 1.0)
+            plt.figure(figsize=(14, fig_h))
+            for i in range(n_leads):
+                ax = plt.subplot(n_leads, 1, i + 1)
+                ax.plot(t, x[i], linewidth=0.9)
+                ax.set_ylabel(lead_names[i] if i < len(lead_names) else f"L{i+1}",
+                              rotation=0, labelpad=18, fontsize=9)
+                ax.grid(True, alpha=0.25)
+                if i != n_leads - 1:
+                    ax.set_xticks([])
+                else:
+                    ax.set_xlabel("Time (s)")
+            plt.tight_layout()
+            plt.savefig(out_png, dpi=160)
+            plt.close()
+
+        else:
+            # "3x4+rhythm" layout (like your friend's image)
+            # We show 2.5s per small panel so 4 panels cover 10s
+            total_seconds = n / float(fs)
+            panel_seconds = min(2.5, total_seconds)  # 2.5s per lead cell
+            panel_samples = int(panel_seconds * fs)
+
+            # If your signal is exactly 10s at fs=100 => 1000 samples, panel_samples=250
+            # Use first 10 seconds if longer
+            max_seconds = 10.0
+            max_samples = min(n, int(max_seconds * fs))
+
+            # slice usable segment
+            x_use = x[:, :max_samples]
+            n_use = x_use.shape[1]
+            total_seconds_use = n_use / float(fs)
+
+            # recompute panel
+            panel_seconds = min(2.5, total_seconds_use)
+            panel_samples = max(1, int(panel_seconds * fs))
+
+            # rhythm strip will use full width (up to 10s)
+            rhythm_idx = 1 if n_leads >= 2 else 0  # II preferred
+
+            # amplitude span (mV): use robust scaling
+            # take percentile to avoid outliers
+            amp = np.percentile(np.abs(x_use), 99)
+            mv_span = max(0.5, min(2.0, float(amp * 1.2)))  # clamp nice range
+
+            # Figure: 4 columns x 3 rows + 1 rhythm row
+            fig = plt.figure(figsize=(14, 8), constrained_layout=False)
+            gs = fig.add_gridspec(4, 4, height_ratios=[1, 1, 1, 1.4], hspace=0.30, wspace=0.15)
+
+            # lead order like standard ECG
+            order = [
+                0, 3, 6, 9,     # I, aVR, V1, V4
+                1, 4, 7, 10,    # II, aVL, V2, V5
+                2, 5, 8, 11     # III, aVF, V3, V6
+            ]
+            order = [i for i in order if i < n_leads]
+
+            # Plot 3x4
+            for k, lead_i in enumerate(order[:12]):
+                r = k // 4
+                c = k % 4
+                ax = fig.add_subplot(gs[r, c])
+
+                start = 0
+                end = min(panel_samples, n_use)
+                t = np.arange(end - start) / float(fs)
+
+                _ecg_grid(ax, seconds_span=(end - start) / float(fs), mv_span=mv_span)
+                ax.plot(t, x_use[lead_i, start:end], linewidth=1.0)
+                ax.text(0.02, 0.85, lead_names[lead_i] if lead_i < len(lead_names) else f"L{lead_i+1}",
+                        transform=ax.transAxes, fontsize=10, fontweight="bold")
+
+            # Rhythm strip (full width)
+            axr = fig.add_subplot(gs[3, :])
+            t = np.arange(n_use) / float(fs)
+            _ecg_grid(axr, seconds_span=total_seconds_use, mv_span=mv_span)
+            axr.plot(t, x_use[rhythm_idx, :], linewidth=1.0)
+            axr.text(0.01, 0.85, "II", transform=axr.transAxes, fontsize=10, fontweight="bold")
+            axr.set_xlabel("Time (s)")
+
+            # small footer like report
+            fig.suptitle("aECG Preview", fontsize=14, fontweight="bold", y=0.98)
+
+            fig.tight_layout(rect=[0, 0, 1, 0.97])
+            fig.savefig(out_png, dpi=170)
+            plt.close(fig)
+
+        rel_url = f"{settings.MEDIA_URL.rstrip('/')}/ecg_previews/{out_png.name}"
+        meta = {"fs": float(fs), "n_leads": int(n_leads), "n_samples": int(n), "shape": list(x.shape), "style": style}
+        return rel_url, meta
+
+    except Exception as e:
+        print("⚠️ preview_from_X failed:", e)
+        return None, None
 
 # ===========================
 # Detect ECG format
@@ -679,6 +912,7 @@ def predict_ecg(request):
                 target_len=1000,
                 remove_baseline=True
             )
+
             model = FusionPredictor.instance()
             probs = model.predict_from_X(X)
             probs = np.asarray(probs).reshape(-1)
@@ -707,16 +941,21 @@ def predict_ecg(request):
                 ecg_obj.prediction_topk = resp["topk"]
                 ecg_obj.prediction_meta = resp["meta"]
                 ecg_obj.predicted_at = timezone.now()
+
                 if preview_url:
                     ecg_obj.preview_image_url = preview_url
-                    ecg_obj.save(update_fields=["prediction_topk", "prediction_meta", "predicted_at", "preview_image_url"])
+                    ecg_obj.save(update_fields=[
+                        "prediction_topk", "prediction_meta", "predicted_at", "preview_image_url"
+                    ])
                 else:
-                    ecg_obj.save(update_fields=["prediction_topk", "prediction_meta", "predicted_at"])
+                    ecg_obj.save(update_fields=[
+                        "prediction_topk", "prediction_meta", "predicted_at"
+                    ])
 
             return JsonResponse(resp, status=200)
 
         # ===== aECG HL7 =====
-        if fmt == "aecg":
+        elif fmt == "aecg":
             leads_mV, fs, meta = read_aecg_hl7_bytes(file_bytes)
 
             X, fs_out = preprocess_single_ecg(
@@ -726,6 +965,7 @@ def predict_ecg(request):
                 target_len=1000,
                 remove_baseline=True
             )
+
             model = FusionPredictor.instance()
             probs = model.predict_from_X(X)
             probs = np.asarray(probs).reshape(-1)
@@ -733,6 +973,15 @@ def predict_ecg(request):
             labels = list(model.fusion_labels)
             idx = np.argsort(-probs)[:10]
             out = [{"label": labels[i], "p": float(probs[i])} for i in idx]
+
+            # ✅ aECG preview (same structure as XML)
+            # after X, fs_out = preprocess_single_ecg(...)
+            preview_url, preview_meta = _make_preview_from_X(
+                X,
+                fs_out,
+                base_stem=f"predict_{uuid.uuid4().hex}",
+                style="3x4+rhythm"
+                )
 
             resp = {
                 "topk": out,
@@ -742,18 +991,32 @@ def predict_ecg(request):
                     "fs_out": fs_out,
                     "aecg_meta": meta,
                 },
+                "preview_image_url": preview_url,
+                "preview_meta": preview_meta,
             }
 
             if ecg_obj:
                 ecg_obj.prediction_topk = resp["topk"]
                 ecg_obj.prediction_meta = resp["meta"]
                 ecg_obj.predicted_at = timezone.now()
-                ecg_obj.save(update_fields=["prediction_topk", "prediction_meta", "predicted_at"])
+
+                if preview_url:
+                    ecg_obj.preview_image_url = preview_url
+                    ecg_obj.save(update_fields=[
+                        "prediction_topk", "prediction_meta", "predicted_at", "preview_image_url"
+                    ])
+                else:
+                    ecg_obj.save(update_fields=[
+                        "prediction_topk", "prediction_meta", "predicted_at"
+                    ])
+
+                    print("RESP KEYS:", resp.keys())
+                    print("PREVIEW:", resp.get("preview_image_url"), resp.get("preview_url"), resp.get("preview_meta"))
 
             return JsonResponse(resp, status=200)
 
         # ===== Image (3x4 / 3x4+1) =====
-        if fmt == "image_3x4":
+        elif fmt == "image_3x4":
             used_layout = layout if layout in ("3x4", "3x4+1") else "3x4"
 
             # NOTE: currently pipeline is 3x4; for 3x4+1 we keep layout in meta but same pipeline.
@@ -773,16 +1036,16 @@ def predict_ecg(request):
 
             return JsonResponse(resp, status=200)
 
-        return JsonResponse({"error": "Unknown format. Expected Philips XML, HL7 aECG, or ECG image."}, status=400)
+        # ===== Unknown =====
+        else:
+            return JsonResponse(
+                {"error": "Unknown format. Expected Philips XML, HL7 aECG, or ECG image.", "format": fmt},
+                status=400
+            )
 
     except Exception as e:
         return JsonResponse({"error": str(e), "format": fmt}, status=500)
-
-
-# ===========================
-# Doctor Notes API
-# ===========================
-@csrf_exempt
+    
 def patient_notes(request, patient_id):
     pid_raw = str(patient_id).strip()
     if not pid_raw.isdigit():
