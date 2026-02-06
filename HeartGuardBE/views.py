@@ -3,6 +3,7 @@ import json
 import uuid
 from pathlib import Path
 from typing import Optional, Tuple
+import os
 
 import numpy as np
 import cv2
@@ -333,6 +334,9 @@ def _predict_from_3x4_image_bytes(
     out_dir = _media_root() / "test_out" / "3x4_api" / job_id
     out_dir.mkdir(parents=True, exist_ok=True)
 
+    # -------------------------
+    # Decode + save source
+    # -------------------------
     src_path = out_dir / f"src_{Path(filename).stem}.png"
     buf = np.frombuffer(img_bytes, dtype=np.uint8)
     img = cv2.imdecode(buf, cv2.IMREAD_COLOR)
@@ -340,9 +344,15 @@ def _predict_from_3x4_image_bytes(
         raise ValueError("Failed to decode image bytes (not a valid PNG/JPG).")
     cv2.imwrite(str(src_path), img)
 
+    # -------------------------
+    # Preprocess to png (3x4)
+    # -------------------------
     pre_png = out_dir / f"pre_{src_path.stem}.png"
     preprocess_3x4(src_path, pre_png)
 
+    # -------------------------
+    # nnU-Net segmentation
+    # -------------------------
     pred_nii = run_nnunet(pre_png, dataset_id=dataset_id, is_png=False)
     if pred_nii.suffixes[-2:] != [".nii", ".gz"]:
         raise RuntimeError(f"Expected .nii.gz from 504, got: {pred_nii}")
@@ -350,6 +360,9 @@ def _predict_from_3x4_image_bytes(
     mask_png = out_dir / f"mask_504_{src_path.stem}.png"
     nii_to_png_mask(pred_nii, mask_png, binary=True)
 
+    # -------------------------
+    # Digitize from mask
+    # -------------------------
     debug_dir = out_dir / f"debug_digitize_{src_path.stem}"
     leads_mV, digi_meta = digitize_from_binary_mask_3x4(
         str(mask_png),
@@ -359,6 +372,9 @@ def _predict_from_3x4_image_bytes(
         return_meta=True,
     )
 
+    # -------------------------
+    # Plot digitized-like-original image
+    # -------------------------
     like_png = out_dir / "digitized_like_original_3x4.png"
     plot_like_original_3x4_vis(
         leads_mV,
@@ -374,6 +390,9 @@ def _predict_from_3x4_image_bytes(
         out_width_px=1400,
     )
 
+    # -------------------------
+    # Prepare signal for model
+    # -------------------------
     X, fs_out = preprocess_single_ecg(
         leads_mV,
         fs_in=int(fs_assumed),
@@ -382,6 +401,9 @@ def _predict_from_3x4_image_bytes(
         remove_baseline=True,
     )
 
+    # -------------------------
+    # Predict
+    # -------------------------
     model = FusionPredictor.instance()
     probs = model.predict_from_X(X)
     probs = np.asarray(probs, dtype=np.float32).reshape(-1)
@@ -390,10 +412,16 @@ def _predict_from_3x4_image_bytes(
     idxs = np.argsort(-probs)[:10]
     topk = [{"label": labels[i], "p": float(probs[i])} for i in idxs]
 
+    # -------------------------
+    # Clean heavy meta
+    # -------------------------
     if isinstance(digi_meta, dict):
         for k in ("y_pix_by_lead", "y_path_by_lead", "y_by_lead", "x_by_lead", "points_by_lead"):
             digi_meta.pop(k, None)
 
+    # -------------------------
+    # Meta (Option A ✅)
+    # -------------------------
     meta = {
         "format": "image",
         "layout": layout,  # "3x4" or "3x4+1" (stored even if pipeline same now)
@@ -402,6 +430,11 @@ def _predict_from_3x4_image_bytes(
         "px_per_mV": px_per_mV,
         "fs_assumed": fs_assumed,
         "fs_out": fs_out,
+
+        # ✅ Option A additions (so predict_ecg can build URL)
+        "job_id": job_id,
+        "digitized_path": str(like_png),
+
         "debug_paths": {
             "out_dir": str(out_dir),
             "src": str(src_path),
@@ -412,8 +445,8 @@ def _predict_from_3x4_image_bytes(
             "digitized_like_original": str(like_png),
         },
     }
-    return topk, meta
 
+    return topk, meta
 
 # ===========================
 # API ENDPOINTS
@@ -903,7 +936,6 @@ def predict_ecg(request):
         elif fmt == "image_3x4":
             used_layout = layout if layout in ("3x4", "3x4+1") else "3x4"
 
-            # NOTE: currently pipeline is 3x4; for 3x4+1 we keep layout in meta but same pipeline.
             topk, meta = _predict_from_3x4_image_bytes(
                 file_bytes,
                 filename=getattr(up, "name", "upload.png"),
@@ -912,20 +944,62 @@ def predict_ecg(request):
 
             resp = {"topk": topk, "meta": meta}
 
+            # -------------------------
+            # ✅ 1) ORIGINAL uploaded image (support different field names)
+            # -------------------------
             if ecg_obj:
-                ecg_obj.prediction_topk = resp["topk"]
-                ecg_obj.prediction_meta = resp["meta"]
+                f = (
+                    getattr(ecg_obj, "image", None)
+                    or getattr(ecg_obj, "file", None)
+                    or getattr(ecg_obj, "ecg_file", None)
+                    or getattr(ecg_obj, "upload", None)
+                )
+                if f and hasattr(f, "url"):
+                    resp["original_image_url"] = request.build_absolute_uri(f.url)
+
+            # -------------------------
+            # ✅ 2) DIGITIZED image URL
+            # -------------------------
+            digitized_fs_path = None
+
+            # Try direct path in meta (if exists)
+            if isinstance(meta, dict):
+                digitized_fs_path = (
+                    meta.get("digitized_path")
+                    or meta.get("digitized_fs_path")
+                    or meta.get("digitized_png_path")
+                    or meta.get("digitized_like_original_path")
+                )
+
+                # If meta has job_id, build expected path
+                job_id = meta.get("job_id") or meta.get("run_id") or meta.get("uid")
+                if not digitized_fs_path and job_id:
+                    digitized_fs_path = os.path.join(
+                        settings.MEDIA_ROOT,
+                        "test_out",
+                        "3x4_api",
+                        str(job_id),
+                        "digitized_like_original_3x4.png",
+                    )
+
+            # Convert filesystem path -> /media/... URL
+            if digitized_fs_path and os.path.exists(digitized_fs_path):
+                rel = os.path.relpath(digitized_fs_path, settings.MEDIA_ROOT).replace("\\", "/")
+                digitized_url = settings.MEDIA_URL.rstrip("/") + "/" + rel
+                resp["digitized_image_url"] = request.build_absolute_uri(digitized_url)
+
+            # ✅ DEBUG (do once)
+            print("RESP_KEYS:", resp.keys())
+            print("ORIGINAL_URL:", resp.get("original_image_url"))
+            print("DIGITIZED_URL:", resp.get("digitized_image_url"))
+
+            if ecg_obj:
+                ecg_obj.prediction_topk = topk
+                ecg_obj.prediction_meta = meta
                 ecg_obj.predicted_at = timezone.now()
                 ecg_obj.save(update_fields=["prediction_topk", "prediction_meta", "predicted_at"])
 
             return JsonResponse(resp, status=200)
-
-        # ===== Unknown =====
-        else:
-            return JsonResponse(
-                {"error": "Unknown format. Expected Philips XML, HL7 aECG, or ECG image.", "format": fmt},
-                status=400
-            )
 
     except Exception as e:
         return JsonResponse({"error": str(e), "format": fmt}, status=500)
