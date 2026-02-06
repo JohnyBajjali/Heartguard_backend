@@ -47,16 +47,11 @@ urlpatterns = [
     # -------------------------
     # Doctor Notes APIs
     # -------------------------
-    # GET  /api/patients/<patient_id>/notes/
-    # POST /api/patients/<patient_id>/notes/
     path(
         "patients/<str:patient_id>/notes/",
         patient_notes,
         name="patient_notes",
     ),
-
-    # PUT / PATCH / DELETE
-    # /api/patients/<patient_id>/notes/<note_id>/
     path(
         "patients/<str:patient_id>/notes/<int:note_id>/",
         patient_note_detail,

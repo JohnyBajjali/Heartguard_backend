@@ -207,10 +207,19 @@ class EcgExam(TimeStampedModel):
 class ECGUpload(models.Model):
     """
     Global database of ECG images (NO patient owner stored here).
+    Now also stores prediction results so they show in "Previous ECGs".
     """
     file = models.ImageField(upload_to="ecg_uploads/")
     source = models.CharField(max_length=50, default="mobile")
     uploaded_at = models.DateTimeField(auto_now_add=True)
+
+    # ✅ NEW: saved prediction output (so patient history can show it)
+    prediction_topk = models.JSONField(null=True, blank=True)  # list[{label,p}]
+    prediction_meta = models.JSONField(null=True, blank=True)  # dict
+    predicted_at = models.DateTimeField(null=True, blank=True)
+
+    # ✅ NEW: preview image url (xml preview, digitized preview, etc.)
+    preview_image_url = models.URLField(null=True, blank=True)
 
     def __str__(self):
         return f"ECGUpload #{self.pk} - {self.file.name} ({self.uploaded_at})"
