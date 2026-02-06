@@ -2,26 +2,27 @@
 import json
 import uuid
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Tuple
 
 import numpy as np
-from lxml import etree
-from django.conf import settings
 import cv2
-import nibabel as nib  # (kept because you had it imported)
+from lxml import etree
 
-from django.http import JsonResponse, HttpResponse
+from django.conf import settings
+from django.core.exceptions import ValidationError
+from django.http import HttpResponse, JsonResponse
+from django.utils import timezone
 from django.views.decorators.csrf import csrf_exempt
 from django.views.decorators.http import require_GET
-from django.core.exceptions import ValidationError
-from django.utils import timezone
 
-from .models import Patient, ECGUpload, DoctorNote  # ✅ includes ECGUpload fields now
+from django.core.files.base import ContentFile
+
+from .models import Patient, ECGUpload, DoctorNote
+
 from .protoecgnet_Model.philips_xml import read_hospital_ecg_xml_repbeats
 from .protoecgnet_Model.aecg_hl7 import read_aecg_hl7_bytes
 from .protoecgnet_Model.preprocess import preprocess_single_ecg
 from .protoecgnet_Model.predictor import FusionPredictor
-from HeartGuardBE.protoecgnet_Model import predictor  # (kept because you had it)
 
 from HeartGuardBE.inference.postprocess import nii_to_png_mask
 from HeartGuardBE.inference.preprocess_3x4 import preprocess_3x4
@@ -29,19 +30,28 @@ from HeartGuardBE.inference.nnunet_runner import run_nnunet
 from HeartGuardBE.inference.digitize_binary_3x4 import digitize_from_binary_mask_3x4
 from HeartGuardBE.inference.vis_504_outputs import plot_like_original_3x4 as plot_like_original_3x4_vis
 
-# ✅ NEW: XML preview generator
 from HeartGuardBE.inference.xml_preview import generate_xml_preview_png
 
 
+# ----------------------------
+# Utils
+# ----------------------------
 def normalize_name(name: str) -> str:
     return " ".join((name or "").strip().split()).lower()
 
 
-def _patient_ecgs_from_ids(patient: "Patient"):
+def _media_root() -> Path:
+    return Path(getattr(settings, "MEDIA_ROOT", Path(__file__).resolve().parents[1] / "media"))
+
+
+def _abs_media_url(request, rel_url: str) -> str:
+    return request.build_absolute_uri(rel_url)
+
+
+def _patient_ecgs_from_ids(patient: Patient):
     """
     Return ECG list in the SAME order stored in patient.ecg_upload_ids (newest first).
-    Skips missing ECG ids safely.
-    Includes prediction fields so Flutter can show history.
+    Includes prediction + preview fields for Flutter history.
     """
     ids = list(patient.ecg_upload_ids or [])
     if not ids:
@@ -50,48 +60,44 @@ def _patient_ecgs_from_ids(patient: "Patient"):
     qs = ECGUpload.objects.filter(id__in=ids)
     by_id = {e.id: e for e in qs}
 
-    ecgs = []
+    out = []
     for eid in ids:
         ecg = by_id.get(eid)
         if not ecg:
             continue
-        ecgs.append({
+        out.append({
             "id": ecg.id,
             "imageUrl": ecg.file.url,
             "uploaded_at": ecg.uploaded_at.isoformat(),
 
-            # ✅ NEW
             "prediction_topk": ecg.prediction_topk,
             "prediction_meta": ecg.prediction_meta,
             "predicted_at": ecg.predicted_at.isoformat() if ecg.predicted_at else None,
             "preview_image_url": ecg.preview_image_url,
         })
-    return ecgs
+    return out
 
 
 # ===========================
-# AUTO CROP (OpenCV) - FIXED
+# AUTO CROP (OpenCV)
 # ===========================
 def _auto_crop_ecg_bytes(image_bytes: bytes) -> bytes:
     """
-    Reliable ECG auto-crop (fixed):
-    1) Detect ECG paper using HSV
-    2) Crop to paper bounding box
-    3) Remove footer titles band (small % so rhythm strip is kept)
-    4) Trim borders safely using edge projections
-    5) Return JPEG bytes
+    Reliable ECG auto-crop:
+    - Detect paper region using HSV red-ish grid
+    - Crop to bounding box
+    - Remove a small footer band
+    - Trim borders using edge projections
+    - Return JPG bytes
     """
-    import numpy as np
-    import cv2
-
     arr = np.frombuffer(image_bytes, dtype=np.uint8)
-    img = cv2.imdecode(arr, cv2.IMREAD_COLOR)  # BGR
+    img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
     if img is None:
         raise ValueError("Could not decode image")
 
     H, W = img.shape[:2]
 
-    def encode_jpg(bgr, quality=92):
+    def encode_jpg(bgr, quality=92) -> bytes:
         ok, out = cv2.imencode(".jpg", bgr, [int(cv2.IMWRITE_JPEG_QUALITY), int(quality)])
         return out.tobytes() if ok else image_bytes
 
@@ -101,7 +107,6 @@ def _auto_crop_ecg_bytes(image_bytes: bytes) -> bytes:
         edges = cv2.Canny(gray, 60, 160)
 
         proj = edges.sum(axis=axis).astype(np.float32)
-
         k = 31
         ker = np.ones(k, dtype=np.float32) / k
         proj_s = np.convolve(proj, ker, mode="same")
@@ -120,17 +125,15 @@ def _auto_crop_ecg_bytes(image_bytes: bytes) -> bytes:
 
         margin = 10
         a = max(0, a - margin)
-        b = min((bgr.shape[0] - 1) if axis == 1 else (bgr.shape[1] - 1), b + margin)
-
         if axis == 0:
-            left, right = a, b
-            if (right - left + 1) > int(0.75 * bgr.shape[1]):
-                return bgr[:, left:right + 1]
+            b = min(bgr.shape[1] - 1, b + margin)
+            if (b - a + 1) > int(0.75 * bgr.shape[1]):
+                return bgr[:, a:b + 1]
             return bgr
         else:
-            top, bottom = a, b
-            if (bottom - top + 1) > int(0.75 * bgr.shape[0]):
-                return bgr[top:bottom + 1, :]
+            b = min(bgr.shape[0] - 1, b + margin)
+            if (b - a + 1) > int(0.75 * bgr.shape[0]):
+                return bgr[a:b + 1, :]
             return bgr
 
     hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
@@ -182,21 +185,20 @@ def _auto_crop_ecg_bytes(image_bytes: bytes) -> bytes:
 
 
 # ===========================
-# Helpers for preview paths
+# XML Preview helper
 # ===========================
 def _make_preview_for_xml(
     file_bytes: bytes,
     *,
     base_stem: str,
     request=None,
-) -> tuple[Optional[str], Optional[dict]]:
+) -> Tuple[Optional[str], Optional[dict]]:
     """
     Create ECG preview PNG for Philips XML.
-    Returns (preview_url, preview_meta) or (None, None) if something fails.
+    Returns (preview_url, preview_meta) or (None, None) if fails.
     """
     try:
-        media_root = Path(getattr(settings, "MEDIA_ROOT", Path(__file__).resolve().parents[1] / "media"))
-        previews_dir = media_root / "ecg_previews"
+        previews_dir = _media_root() / "ecg_previews"
         previews_dir.mkdir(parents=True, exist_ok=True)
 
         out_png = previews_dir / f"{base_stem}_preview.png"
@@ -212,321 +214,8 @@ def _make_preview_for_xml(
 
 
 # ===========================
-# API ENDPOINTS
+# Detect ECG format
 # ===========================
-@csrf_exempt
-def patients_list_create(request):
-    if request.method == "GET":
-        patients = Patient.objects.all().order_by("-created_at")
-        data = []
-        for p in patients:
-            data.append({
-                "patient_id": p.patient_id,
-                "full_name": p.full_name,
-                "age": p.age,
-                "gender": p.gender,
-                "created_at": p.created_at.isoformat(),
-                "ecg_count": len(p.ecg_upload_ids or []),
-            })
-        return JsonResponse({"patients": data}, status=200)
-
-    if request.method == "POST":
-        try:
-            data = json.loads(request.body.decode("utf-8"))
-        except Exception:
-            return JsonResponse({"error": "Invalid JSON body"}, status=400)
-
-        patient_id_raw = str(data.get("patient_id", "")).strip()
-        full_name = str(data.get("full_name", "")).strip()
-        gender = data.get("gender", None)
-        age_raw = data.get("age", None)
-
-        if not patient_id_raw:
-            return JsonResponse({"error": "patient_id is required"}, status=400)
-        if not patient_id_raw.isdigit():
-            return JsonResponse({"error": "patient_id must be an integer"}, status=400)
-
-        if not full_name:
-            return JsonResponse({"error": "full_name is required"}, status=400)
-
-        patient_id = int(patient_id_raw)
-
-        if Patient.objects.filter(patient_id=patient_id).exists():
-            return JsonResponse({"error": "patient_id already exists"}, status=409)
-
-        if gender not in ("M", "F"):
-            return JsonResponse({"error": "gender is required and must be 'M' or 'F'"}, status=400)
-
-        if age_raw is None or str(age_raw).strip() == "":
-            return JsonResponse({"error": "age is required"}, status=400)
-
-        try:
-            age = int(str(age_raw).strip())
-        except Exception:
-            return JsonResponse({"error": "age must be an integer"}, status=400)
-
-        if age < 1 or age > 130:
-            return JsonResponse({"error": "age must be between 1 and 130"}, status=400)
-
-        patient = Patient(
-            patient_id=patient_id,
-            full_name=full_name,
-            age=age,
-            gender=gender,
-        )
-
-        try:
-            patient.full_clean()
-        except ValidationError as e:
-            return JsonResponse({"error": e.message_dict or str(e)}, status=400)
-        patient.save()
-
-        return JsonResponse({
-            "patient": {
-                "patient_id": patient.patient_id,
-                "full_name": patient.full_name,
-                "age": patient.age,
-                "gender": patient.gender,
-                "created_at": patient.created_at.isoformat(),
-                "ecg_count": len(patient.ecg_upload_ids or []),
-            }}, status=201)
-
-    return JsonResponse({"error": "Method not allowed"}, status=405)
-
-
-@csrf_exempt
-def patient_delete(request):
-    if request.method != "POST":
-        return JsonResponse({"error": "POST required"}, status=405)
-
-    try:
-        data = json.loads(request.body.decode("utf-8"))
-    except Exception:
-        return JsonResponse({"error": "Invalid JSON body"}, status=400)
-
-    patient_id_raw = str(data.get("patient_id", "")).strip()
-    if not patient_id_raw:
-        return JsonResponse({"error": "patient_id is required"}, status=400)
-    if not patient_id_raw.isdigit():
-        return JsonResponse({"error": "patient_id must be an integer"}, status=400)
-
-    patient_id = int(patient_id_raw)
-
-    try:
-        patient = Patient.objects.get(patient_id=patient_id)
-    except Patient.DoesNotExist:
-        return JsonResponse({"error": "patient not found"}, status=404)
-
-    ids = list(patient.ecg_upload_ids or [])
-    if ids:
-        ecgs = ECGUpload.objects.filter(id__in=ids)
-        for e in ecgs:
-            try:
-                e.file.delete(save=False)
-            except Exception:
-                pass
-        ecgs.delete()
-
-    patient.delete()
-    return JsonResponse({"ok": True, "deleted_patient_id": patient_id}, status=200)
-
-
-@csrf_exempt
-def patient_login_or_create(request):
-    if request.method != "POST":
-        return JsonResponse({"error": "POST required"}, status=405)
-
-    try:
-        data = json.loads(request.body.decode())
-    except Exception:
-        data = request.POST
-
-    name = str(data.get("name", "")).strip()
-    patient_id_raw = str(data.get("patient_id", "")).strip()
-
-    if not name:
-        return JsonResponse({"error": "name is required"}, status=400)
-    if not patient_id_raw:
-        return JsonResponse({"error": "patient_id is required"}, status=400)
-    if not patient_id_raw.isdigit():
-        return JsonResponse({"error": "patient_id must be an integer"}, status=400)
-
-    patient_id = int(patient_id_raw)
-
-    try:
-        patient = Patient.objects.get(patient_id=patient_id)
-        if normalize_name(patient.full_name) != normalize_name(name):
-            return JsonResponse(
-                {"error": "This ID is already registered to another person. Please use your own ID."},
-                status=409,
-            )
-        created = False
-    except Patient.DoesNotExist:
-        patient = Patient(patient_id=patient_id, full_name=name)
-        try:
-            patient.full_clean()
-        except ValidationError as e:
-            return JsonResponse({"error": e.message_dict or str(e)}, status=400)
-        patient.save()
-        created = True
-
-    ecgs = _patient_ecgs_from_ids(patient)
-
-    return JsonResponse(
-        {
-            "patient_id": patient.patient_id,
-            "name": patient.full_name,
-            "gender": patient.gender,
-            "ecgs": ecgs,
-            "created": created,
-        },
-        status=200,
-    )
-
-
-@csrf_exempt
-def ecg_upload(request):
-    """
-    POST /api/ecg/upload/  (multipart)
-    """
-    if request.method != "POST":
-        return JsonResponse({"error": "POST required"}, status=405)
-
-    uploaded_file = request.FILES.get("file")
-    source = request.POST.get("source", "mobile").strip()
-    patient_id_raw = request.POST.get("patient_id", "").strip()
-    patient_name = request.POST.get("patient_name", "").strip()
-
-    if not uploaded_file:
-        return JsonResponse({"error": "No file uploaded"}, status=400)
-    if not patient_name:
-        return JsonResponse({"error": "patient_name is required"}, status=400)
-    if not patient_id_raw:
-        return JsonResponse({"error": "patient_id is required"}, status=400)
-    if not patient_id_raw.isdigit():
-        return JsonResponse({"error": "patient_id must be an integer"}, status=400)
-
-    patient_id = int(patient_id_raw)
-
-    try:
-        patient = Patient.objects.get(patient_id=patient_id)
-        if normalize_name(patient.full_name) != normalize_name(patient_name):
-            return JsonResponse(
-                {"error": "This ID is already registered to another person. Please use your own ID."},
-                status=409,
-            )
-    except Patient.DoesNotExist:
-        patient = Patient(patient_id=patient_id, full_name=patient_name)
-        try:
-            patient.full_clean()
-        except ValidationError as e:
-            return JsonResponse({"error": e.message_dict or str(e)}, status=400)
-        patient.save()
-
-    ext = Path(uploaded_file.name).suffix.lower() or ".jpg"
-    new_filename = f"{uuid.uuid4()}{ext}"
-    uploaded_file.name = new_filename
-
-    file_bytes = uploaded_file.read()
-
-    from django.core.files.base import ContentFile
-    ecg = ECGUpload.objects.create(
-        file=ContentFile(file_bytes, name=new_filename),
-        source=source,
-    )
-
-    ids = list(patient.ecg_upload_ids or [])
-    ids.insert(0, ecg.id)
-    patient.ecg_upload_ids = ids[:500]
-    patient.save(update_fields=["ecg_upload_ids"])
-
-    preview_url = None
-    preview_meta = None
-    if ext == ".xml":
-        stem = f"ecg_{ecg.id}_{Path(new_filename).stem}"
-        preview_url, preview_meta = _make_preview_for_xml(file_bytes, base_stem=stem, request=request)
-
-        # ✅ save preview url in ECGUpload so it appears later in list
-        if preview_url:
-            ecg.preview_image_url = preview_url
-            ecg.save(update_fields=["preview_image_url"])
-
-    return JsonResponse(
-        {
-            "status": "ok",
-            "ecg_id": ecg.id,
-            "url": request.build_absolute_uri(ecg.file.url),
-            "filename": new_filename,
-            "source": ecg.source,
-            "uploaded_at": ecg.uploaded_at.isoformat(),
-            "patient_id": patient.patient_id,
-            "patient_name": patient.full_name,
-            "preview_image_url": preview_url,
-            "preview_meta": preview_meta,
-        },
-        status=201,
-    )
-
-
-@csrf_exempt
-def ecg_auto_crop(request):
-    if request.method != "POST":
-        return JsonResponse({"error": "POST required"}, status=405)
-
-    uploaded_file = request.FILES.get("file")
-    if not uploaded_file:
-        return JsonResponse({"error": "No file uploaded"}, status=400)
-
-    try:
-        cropped_jpg = _auto_crop_ecg_bytes(uploaded_file.read())
-    except Exception as e:
-        return JsonResponse({"error": f"auto crop failed: {e}"}, status=400)
-
-    return HttpResponse(cropped_jpg, content_type="image/jpeg")
-
-
-@require_GET
-def list_ecgs_for_patient(request):
-    """
-    GET /api/ecg/list/?patient_id=123
-    """
-    patient_id_raw = request.GET.get("patient_id", "").strip()
-    if not patient_id_raw:
-        return JsonResponse({"error": "patient_id is required"}, status=400)
-    if not patient_id_raw.isdigit():
-        return JsonResponse({"error": "patient_id must be an integer"}, status=400)
-
-    patient_id = int(patient_id_raw)
-
-    try:
-        patient = Patient.objects.get(patient_id=patient_id)
-    except Patient.DoesNotExist:
-        return JsonResponse({"error": "patient not found"}, status=404)
-
-    ecgs = _patient_ecgs_from_ids(patient)
-
-    return JsonResponse(
-        [
-            {
-                "id": e["id"],
-                "patient_id": patient.patient_id,
-                "patient_name": patient.full_name,
-                "url": request.build_absolute_uri(e["imageUrl"]),
-                "uploaded_at": e["uploaded_at"],
-
-                # ✅ NEW
-                "prediction_topk": e.get("prediction_topk"),
-                "prediction_meta": e.get("prediction_meta"),
-                "predicted_at": e.get("predicted_at"),
-                "preview_image_url": e.get("preview_image_url"),
-            }
-            for e in ecgs
-        ],
-        safe=False,
-        status=200,
-    )
-
-
 def detect_ecg_format(file_bytes: bytes) -> str:
     parser = etree.XMLParser(recover=True, huge_tree=True)
     try:
@@ -549,26 +238,22 @@ def detect_ecg_format(file_bytes: bytes) -> str:
     return "unknown"
 
 
-def _norm_code(s: str) -> str:
-    if s is None:
-        return ""
-    s = str(s)
-    s = s.replace("\ufeff", "")
-    s = s.replace("\u200b", "")
-    s = s.replace("\u00a0", " ")
-    return s.strip()
-
-
-def _predict_from_3x4_image_bytes(img_bytes: bytes, filename: str = "upload.png"):
+# ===========================
+# 3x4 image pipeline
+# ===========================
+def _predict_from_3x4_image_bytes(
+    img_bytes: bytes,
+    filename: str = "upload.png",
+    *,
+    layout: str = "3x4",
+):
     dataset_id = "504"
     target_len = 1000
     px_per_mV = 40.0
     fs_assumed = 100.0
 
-    media_root = Path(getattr(settings, "MEDIA_ROOT", Path(__file__).resolve().parents[1] / "media"))
     job_id = uuid.uuid4().hex
-
-    out_dir = media_root / "test_out" / "3x4_api" / job_id
+    out_dir = _media_root() / "test_out" / "3x4_api" / job_id
     out_dir.mkdir(parents=True, exist_ok=True)
 
     src_path = out_dir / f"src_{Path(filename).stem}.png"
@@ -620,11 +305,11 @@ def _predict_from_3x4_image_bytes(img_bytes: bytes, filename: str = "upload.png"
         remove_baseline=True,
     )
 
-    predictor = FusionPredictor.instance()
-    probs = predictor.predict_from_X(X)
+    model = FusionPredictor.instance()
+    probs = model.predict_from_X(X)
     probs = np.asarray(probs, dtype=np.float32).reshape(-1)
 
-    labels = list(predictor.fusion_labels)
+    labels = list(model.fusion_labels)
     idxs = np.argsort(-probs)[:10]
     topk = [{"label": labels[i], "p": float(probs[i])} for i in idxs]
 
@@ -633,7 +318,8 @@ def _predict_from_3x4_image_bytes(img_bytes: bytes, filename: str = "upload.png"
             digi_meta.pop(k, None)
 
     meta = {
-        "format": "image_3x4",
+        "format": "image",
+        "layout": layout,  # "3x4" or "3x4+1" (stored even if pipeline same now)
         "dataset_id": dataset_id,
         "target_len": target_len,
         "px_per_mV": px_per_mV,
@@ -647,21 +333,326 @@ def _predict_from_3x4_image_bytes(img_bytes: bytes, filename: str = "upload.png"
             "mask_png": str(mask_png),
             "debug_digitize": str(debug_dir),
             "digitized_like_original": str(like_png),
-        }
+        },
     }
-
     return topk, meta
+
+
+# ===========================
+# API ENDPOINTS
+# ===========================
+@csrf_exempt
+def patients_list_create(request):
+    if request.method == "GET":
+        patients = Patient.objects.all().order_by("-created_at")
+        data = []
+        for p in patients:
+            data.append({
+                "patient_id": p.patient_id,
+                "full_name": p.full_name,
+                "age": p.age,
+                "gender": p.gender,
+                "created_at": p.created_at.isoformat(),
+                "ecg_count": len(p.ecg_upload_ids or []),
+            })
+        return JsonResponse({"patients": data}, status=200)
+
+    if request.method == "POST":
+        try:
+            data = json.loads(request.body.decode("utf-8"))
+        except Exception:
+            return JsonResponse({"error": "Invalid JSON body"}, status=400)
+
+        patient_id_raw = str(data.get("patient_id", "")).strip()
+        full_name = str(data.get("full_name", "")).strip()
+        gender = data.get("gender", None)
+        age_raw = data.get("age", None)
+
+        if not patient_id_raw:
+            return JsonResponse({"error": "patient_id is required"}, status=400)
+        if not patient_id_raw.isdigit():
+            return JsonResponse({"error": "patient_id must be an integer"}, status=400)
+
+        if not full_name:
+            return JsonResponse({"error": "full_name is required"}, status=400)
+
+        patient_id = int(patient_id_raw)
+
+        if Patient.objects.filter(patient_id=patient_id).exists():
+            return JsonResponse({"error": "patient_id already exists"}, status=409)
+
+        if gender not in ("M", "F"):
+            return JsonResponse({"error": "gender is required and must be 'M' or 'F'"}, status=400)
+
+        if age_raw is None or str(age_raw).strip() == "":
+            return JsonResponse({"error": "age is required"}, status=400)
+        try:
+            age = int(str(age_raw).strip())
+        except Exception:
+            return JsonResponse({"error": "age must be an integer"}, status=400)
+        if age < 1 or age > 130:
+            return JsonResponse({"error": "age must be between 1 and 130"}, status=400)
+
+        patient = Patient(patient_id=patient_id, full_name=full_name, age=age, gender=gender)
+
+        try:
+            patient.full_clean()
+        except ValidationError as e:
+            return JsonResponse({"error": e.message_dict or str(e)}, status=400)
+
+        patient.save()
+        return JsonResponse({
+            "patient": {
+                "patient_id": patient.patient_id,
+                "full_name": patient.full_name,
+                "age": patient.age,
+                "gender": patient.gender,
+                "created_at": patient.created_at.isoformat(),
+                "ecg_count": len(patient.ecg_upload_ids or []),
+            }
+        }, status=201)
+
+    return JsonResponse({"error": "Method not allowed"}, status=405)
+
+
+@csrf_exempt
+def patient_delete(request):
+    if request.method != "POST":
+        return JsonResponse({"error": "POST required"}, status=405)
+
+    try:
+        data = json.loads(request.body.decode("utf-8"))
+    except Exception:
+        return JsonResponse({"error": "Invalid JSON body"}, status=400)
+
+    patient_id_raw = str(data.get("patient_id", "")).strip()
+    if not patient_id_raw:
+        return JsonResponse({"error": "patient_id is required"}, status=400)
+    if not patient_id_raw.isdigit():
+        return JsonResponse({"error": "patient_id must be an integer"}, status=400)
+
+    patient_id = int(patient_id_raw)
+
+    try:
+        patient = Patient.objects.get(patient_id=patient_id)
+    except Patient.DoesNotExist:
+        return JsonResponse({"error": "patient not found"}, status=404)
+
+    ids = list(patient.ecg_upload_ids or [])
+    if ids:
+        ecgs = ECGUpload.objects.filter(id__in=ids)
+        for e in ecgs:
+            try:
+                e.file.delete(save=False)
+            except Exception:
+                pass
+        ecgs.delete()
+
+    patient.delete()
+    return JsonResponse({"ok": True, "deleted_patient_id": patient_id}, status=200)
+
+
+@csrf_exempt
+def patient_login_or_create(request):
+    if request.method != "POST":
+        return JsonResponse({"error": "POST required"}, status=405)
+
+    try:
+        data = json.loads(request.body.decode("utf-8"))
+    except Exception:
+        data = request.POST
+
+    name = str(data.get("name", "")).strip()
+    patient_id_raw = str(data.get("patient_id", "")).strip()
+
+    if not name:
+        return JsonResponse({"error": "name is required"}, status=400)
+    if not patient_id_raw:
+        return JsonResponse({"error": "patient_id is required"}, status=400)
+    if not patient_id_raw.isdigit():
+        return JsonResponse({"error": "patient_id must be an integer"}, status=400)
+
+    patient_id = int(patient_id_raw)
+
+    try:
+        patient = Patient.objects.get(patient_id=patient_id)
+        if normalize_name(patient.full_name) != normalize_name(name):
+            return JsonResponse(
+                {"error": "This ID is already registered to another person. Please use your own ID."},
+                status=409,
+            )
+        created = False
+    except Patient.DoesNotExist:
+        patient = Patient(patient_id=patient_id, full_name=name)
+        try:
+            patient.full_clean()
+        except ValidationError as e:
+            return JsonResponse({"error": e.message_dict or str(e)}, status=400)
+        patient.save()
+        created = True
+
+    ecgs = _patient_ecgs_from_ids(patient)
+
+    return JsonResponse({
+        "patient_id": patient.patient_id,
+        "name": patient.full_name,
+        "gender": patient.gender,
+        "ecgs": ecgs,
+        "created": created,
+    }, status=200)
+
+
+@csrf_exempt
+def ecg_upload(request):
+    """
+    POST /api/ecg/upload/  (multipart)
+    Saves file in ECGUpload and adds its id into Patient.ecg_upload_ids
+    """
+    if request.method != "POST":
+        return JsonResponse({"error": "POST required"}, status=405)
+
+    uploaded_file = request.FILES.get("file")
+    source = (request.POST.get("source", "mobile") or "mobile").strip()
+    patient_id_raw = (request.POST.get("patient_id", "") or "").strip()
+    patient_name = (request.POST.get("patient_name", "") or "").strip()
+
+    if not uploaded_file:
+        return JsonResponse({"error": "No file uploaded"}, status=400)
+    if not patient_name:
+        return JsonResponse({"error": "patient_name is required"}, status=400)
+    if not patient_id_raw:
+        return JsonResponse({"error": "patient_id is required"}, status=400)
+    if not patient_id_raw.isdigit():
+        return JsonResponse({"error": "patient_id must be an integer"}, status=400)
+
+    patient_id = int(patient_id_raw)
+
+    # find/create patient
+    try:
+        patient = Patient.objects.get(patient_id=patient_id)
+        if normalize_name(patient.full_name) != normalize_name(patient_name):
+            return JsonResponse(
+                {"error": "This ID is already registered to another person. Please use your own ID."},
+                status=409,
+            )
+    except Patient.DoesNotExist:
+        patient = Patient(patient_id=patient_id, full_name=patient_name)
+        try:
+            patient.full_clean()
+        except ValidationError as e:
+            return JsonResponse({"error": e.message_dict or str(e)}, status=400)
+        patient.save()
+
+    ext = (Path(uploaded_file.name).suffix.lower() or ".jpg")
+    new_filename = f"{uuid.uuid4()}{ext}"
+
+    file_bytes = uploaded_file.read()
+
+    ecg = ECGUpload.objects.create(
+        file=ContentFile(file_bytes, name=new_filename),
+        source=source,
+    )
+
+    ids = list(patient.ecg_upload_ids or [])
+    ids.insert(0, ecg.id)
+    patient.ecg_upload_ids = ids[:500]
+    patient.save(update_fields=["ecg_upload_ids"])
+
+    preview_url = None
+    preview_meta = None
+
+    # XML preview
+    if ext == ".xml":
+        stem = f"ecg_{ecg.id}_{Path(new_filename).stem}"
+        preview_url, preview_meta = _make_preview_for_xml(file_bytes, base_stem=stem, request=request)
+        if preview_url:
+            ecg.preview_image_url = preview_url
+            ecg.save(update_fields=["preview_image_url"])
+
+    return JsonResponse({
+        "status": "ok",
+        "ecg_id": ecg.id,
+        "url": request.build_absolute_uri(ecg.file.url),
+        "filename": new_filename,
+        "source": ecg.source,
+        "uploaded_at": ecg.uploaded_at.isoformat(),
+        "patient_id": patient.patient_id,
+        "patient_name": patient.full_name,
+        "preview_image_url": preview_url,
+        "preview_meta": preview_meta,
+    }, status=201)
+
+
+@csrf_exempt
+def ecg_auto_crop(request):
+    if request.method != "POST":
+        return JsonResponse({"error": "POST required"}, status=405)
+
+    uploaded_file = request.FILES.get("file")
+    if not uploaded_file:
+        return JsonResponse({"error": "No file uploaded"}, status=400)
+
+    try:
+        cropped_jpg = _auto_crop_ecg_bytes(uploaded_file.read())
+    except Exception as e:
+        return JsonResponse({"error": f"auto crop failed: {e}"}, status=400)
+
+    return HttpResponse(cropped_jpg, content_type="image/jpeg")
+
+
+@require_GET
+def list_ecgs_for_patient(request):
+    """
+    GET /api/ecg/list/?patient_id=123
+    Returns LIST (safe=False) because Flutter expects List.
+    """
+    patient_id_raw = (request.GET.get("patient_id", "") or "").strip()
+    if not patient_id_raw:
+        return JsonResponse({"error": "patient_id is required"}, status=400)
+    if not patient_id_raw.isdigit():
+        return JsonResponse({"error": "patient_id must be an integer"}, status=400)
+
+    patient_id = int(patient_id_raw)
+
+    try:
+        patient = Patient.objects.get(patient_id=patient_id)
+    except Patient.DoesNotExist:
+        return JsonResponse({"error": "patient not found"}, status=404)
+
+    ecgs = _patient_ecgs_from_ids(patient)
+
+    return JsonResponse([
+        {
+            "id": e["id"],
+            "patient_id": patient.patient_id,
+            "patient_name": patient.full_name,
+            "url": request.build_absolute_uri(e["imageUrl"]),
+            "uploaded_at": e["uploaded_at"],
+
+            "prediction_topk": e.get("prediction_topk"),
+            "prediction_meta": e.get("prediction_meta"),
+            "predicted_at": e.get("predicted_at"),
+            "preview_image_url": e.get("preview_image_url"),
+        }
+        for e in ecgs
+    ], safe=False, status=200)
 
 
 @csrf_exempt
 def predict_ecg(request):
+    """
+    POST /api/ecg/predict/  (multipart)
+    - Detect format: philips xml / aecg / image
+    - Predict
+    - If ecg_id provided, save prediction in ECGUpload row
+    """
     if request.method != "POST":
         return JsonResponse({"error": "POST only"}, status=405)
 
     if "file" not in request.FILES:
         return JsonResponse({"error": "missing file field"}, status=400)
 
-    # ✅ NEW: link prediction to existing uploaded ECG by ecg_id (sent from Flutter)
+    # optional: link prediction to existing ECGUpload row
     ecg_obj = None
     ecg_id_raw = (request.POST.get("ecg_id", "") or "").strip()
     if ecg_id_raw.isdigit():
@@ -670,15 +661,16 @@ def predict_ecg(request):
         except ECGUpload.DoesNotExist:
             ecg_obj = None
 
+    layout = (request.POST.get("layout", "") or "").strip()  # "3x4" or "3x4+1"
+
     up = request.FILES["file"]
     file_bytes = up.read()
     fmt = detect_ecg_format(file_bytes)
 
     try:
-        # ===== XML / Philips =====
+        # ===== Philips XML =====
         if fmt == "philips":
             leads_mV, fs, meta = read_hospital_ecg_xml_repbeats(file_bytes)
-            meta_key = "xml_meta"
 
             X, fs_out = preprocess_single_ecg(
                 leads_mV,
@@ -687,27 +679,30 @@ def predict_ecg(request):
                 target_len=1000,
                 remove_baseline=True
             )
-            predictor = FusionPredictor.instance()
-            probs = predictor.predict_from_X(X)
+            model = FusionPredictor.instance()
+            probs = model.predict_from_X(X)
+            probs = np.asarray(probs).reshape(-1)
 
-            labels = predictor.fusion_labels
+            labels = list(model.fusion_labels)
             idx = np.argsort(-probs)[:10]
             out = [{"label": labels[i], "p": float(probs[i])} for i in idx]
 
             preview_url, preview_meta = _make_preview_for_xml(
-                file_bytes,
-                base_stem=f"predict_{uuid.uuid4().hex}",
-                request=request,
+                file_bytes, base_stem=f"predict_{uuid.uuid4().hex}", request=request
             )
 
             resp = {
                 "topk": out,
-                "meta": {"fs_in": fs, "fs_out": fs_out, meta_key: meta, "format": fmt},
+                "meta": {
+                    "format": "philips",
+                    "fs_in": fs,
+                    "fs_out": fs_out,
+                    "xml_meta": meta,
+                },
                 "preview_image_url": preview_url,
                 "preview_meta": preview_meta,
             }
 
-            # ✅ SAVE result into ECGUpload row
             if ecg_obj:
                 ecg_obj.prediction_topk = resp["topk"]
                 ecg_obj.prediction_meta = resp["meta"]
@@ -720,10 +715,9 @@ def predict_ecg(request):
 
             return JsonResponse(resp, status=200)
 
-        # ===== aECG =====
+        # ===== aECG HL7 =====
         if fmt == "aecg":
             leads_mV, fs, meta = read_aecg_hl7_bytes(file_bytes)
-            meta_key = "aecg_meta"
 
             X, fs_out = preprocess_single_ecg(
                 leads_mV,
@@ -732,16 +726,22 @@ def predict_ecg(request):
                 target_len=1000,
                 remove_baseline=True
             )
-            predictor = FusionPredictor.instance()
-            probs = predictor.predict_from_X(X)
+            model = FusionPredictor.instance()
+            probs = model.predict_from_X(X)
+            probs = np.asarray(probs).reshape(-1)
 
-            labels = predictor.fusion_labels
+            labels = list(model.fusion_labels)
             idx = np.argsort(-probs)[:10]
             out = [{"label": labels[i], "p": float(probs[i])} for i in idx]
 
             resp = {
                 "topk": out,
-                "meta": {"fs_in": fs, "fs_out": fs_out, meta_key: meta, "format": fmt},
+                "meta": {
+                    "format": "aecg",
+                    "fs_in": fs,
+                    "fs_out": fs_out,
+                    "aecg_meta": meta,
+                },
             }
 
             if ecg_obj:
@@ -752,9 +752,17 @@ def predict_ecg(request):
 
             return JsonResponse(resp, status=200)
 
-        # ===== IMAGE 3x4 =====
+        # ===== Image (3x4 / 3x4+1) =====
         if fmt == "image_3x4":
-            topk, meta = _predict_from_3x4_image_bytes(file_bytes, filename=getattr(up, "name", "upload.png"))
+            used_layout = layout if layout in ("3x4", "3x4+1") else "3x4"
+
+            # NOTE: currently pipeline is 3x4; for 3x4+1 we keep layout in meta but same pipeline.
+            topk, meta = _predict_from_3x4_image_bytes(
+                file_bytes,
+                filename=getattr(up, "name", "upload.png"),
+                layout=used_layout,
+            )
+
             resp = {"topk": topk, "meta": meta}
 
             if ecg_obj:
@@ -765,14 +773,14 @@ def predict_ecg(request):
 
             return JsonResponse(resp, status=200)
 
-        return JsonResponse({"error": "Unknown format. Expected Philips XML, HL7 aECG, or 3x4 PNG/JPG."}, status=400)
+        return JsonResponse({"error": "Unknown format. Expected Philips XML, HL7 aECG, or ECG image."}, status=400)
 
     except Exception as e:
         return JsonResponse({"error": str(e), "format": fmt}, status=500)
 
 
 # ===========================
-# ✅ DOCTOR NOTES API
+# Doctor Notes API
 # ===========================
 @csrf_exempt
 def patient_notes(request, patient_id):

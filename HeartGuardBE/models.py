@@ -18,9 +18,7 @@ class TimeStampedModel(models.Model):
 
 
 class Hospital(TimeStampedModel):
-    """
-    A tenant-like unit. Later we can add address, phone, etc.
-    """
+    """A tenant-like unit (optional for now)."""
     name = models.CharField(max_length=200, unique=True)
 
     class Meta:
@@ -31,31 +29,18 @@ class Hospital(TimeStampedModel):
 
 
 class UserProfile(TimeStampedModel):
-    """
-    Optional profile for each user to hold role + hospital scope.
-    """
+    """Optional profile for each user to hold role + hospital scope."""
+
     class Roles(models.TextChoices):
         SUPERADMIN = "SUPERADMIN", "Super Admin"
         HOSPITAL_ADMIN = "HOSPITAL_ADMIN", "Hospital Admin"
         DOCTOR = "DOCTOR", "Doctor"
         STAFF = "STAFF", "Staff"
 
-    user = models.OneToOneField(
-        User,
-        on_delete=models.CASCADE,
-        related_name="profile",
-    )
-    role = models.CharField(
-        max_length=20,
-        choices=Roles.choices,
-        default=Roles.STAFF,
-    )
+    user = models.OneToOneField(User, on_delete=models.CASCADE, related_name="profile")
+    role = models.CharField(max_length=20, choices=Roles.choices, default=Roles.STAFF)
     hospital = models.ForeignKey(
-        Hospital,
-        null=True,
-        blank=True,
-        on_delete=models.SET_NULL,
-        related_name="users",
+        Hospital, null=True, blank=True, on_delete=models.SET_NULL, related_name="users"
     )
 
     class Meta:
@@ -72,7 +57,7 @@ def create_profile_for_user(sender, instance, created, **kwargs):
         UserProfile.objects.create(user=instance)
 
 
-# Only letters and spaces
+# Only letters and spaces (keep as-is)
 patient_name_validator = RegexValidator(
     regex=r"^[A-Za-z\s]+$",
     message="Name must contain letters and spaces only.",
@@ -83,12 +68,11 @@ class Patient(TimeStampedModel):
     """
     Patient for mobile login + optional dashboard fields.
 
-    IMPORTANT (your requirement):
+    IMPORTANT:
     - ECGUpload table does NOT store patient owner
     - Patient stores history as a list of ECGUpload IDs in ecg_upload_ids
     """
 
-    # Mobile login fields
     patient_id = models.PositiveIntegerField(unique=True)
     full_name = models.CharField(
         max_length=255,
@@ -96,10 +80,9 @@ class Patient(TimeStampedModel):
         help_text="Letters and spaces only.",
     )
 
-    # Patient ECG history: list of ECGUpload IDs (newest first)
+    # History of ECGUpload IDs (newest first)
     ecg_upload_ids = models.JSONField(default=list, blank=True)
 
-    # Optional dashboard fields
     class Gender(models.TextChoices):
         MALE = "M", "Male"
         FEMALE = "F", "Female"
@@ -110,7 +93,7 @@ class Patient(TimeStampedModel):
     date_of_birth = models.DateField(null=True, blank=True)
     age = models.PositiveSmallIntegerField(null=True, blank=True)
 
-    # ✅ make gender optional (better for your UI checkbox)
+    # gender optional for some flows
     gender = models.CharField(
         max_length=1,
         choices=Gender.choices,
@@ -120,11 +103,7 @@ class Patient(TimeStampedModel):
     )
 
     hospital = models.ForeignKey(
-        Hospital,
-        null=True,
-        blank=True,
-        on_delete=models.CASCADE,
-        related_name="patients",
+        Hospital, null=True, blank=True, on_delete=models.CASCADE, related_name="patients"
     )
     attending_doctor = models.ForeignKey(
         User,
@@ -134,12 +113,7 @@ class Patient(TimeStampedModel):
         related_name="patients_under_care",
     )
 
-    mrn = models.CharField(
-        max_length=64,
-        blank=True,
-        default="",
-        help_text="Medical Record Number (optional)",
-    )
+    mrn = models.CharField(max_length=64, blank=True, default="", help_text="MRN (optional)")
 
     class Meta:
         ordering = ["-created_at"]
@@ -153,25 +127,16 @@ class Patient(TimeStampedModel):
 
 
 class EcgExam(TimeStampedModel):
-    """
-    Your AI exam record (kept as-is). It still points to Patient.
-    """
+    """Kept as-is (legacy/optional AI exam record)."""
+
     class Status(models.TextChoices):
         PENDING = "PENDING", "Pending"
         PROCESSING = "PROCESSING", "Processing"
         READY = "READY", "Ready"
         FAILED = "FAILED", "Failed"
 
-    patient = models.ForeignKey(
-        Patient,
-        on_delete=models.CASCADE,
-        related_name="ecg_exams",
-    )
-    status = models.CharField(
-        max_length=12,
-        choices=Status.choices,
-        default=Status.PENDING,
-    )
+    patient = models.ForeignKey(Patient, on_delete=models.CASCADE, related_name="ecg_exams")
+    status = models.CharField(max_length=12, choices=Status.choices, default=Status.PENDING)
 
     top_predictions = models.JSONField(default=list, blank=True)
 
@@ -179,11 +144,7 @@ class EcgExam(TimeStampedModel):
     device_model = models.CharField(max_length=80, blank=True, default="")
     source_filename = models.CharField(max_length=255, blank=True, default="")
     uploaded_by = models.ForeignKey(
-        User,
-        null=True,
-        blank=True,
-        on_delete=models.SET_NULL,
-        related_name="uploaded_ecgs",
+        User, null=True, blank=True, on_delete=models.SET_NULL, related_name="uploaded_ecgs"
     )
 
     report_url = models.URLField(null=True, blank=True)
@@ -206,41 +167,34 @@ class EcgExam(TimeStampedModel):
 
 class ECGUpload(models.Model):
     """
-    Global database of ECG images (NO patient owner stored here).
-    Now also stores prediction results so they show in "Previous ECGs".
+    Global database of ECG files (NO patient owner stored here).
+    Stores prediction results so patient history can show it.
     """
+
     file = models.ImageField(upload_to="ecg_uploads/")
     source = models.CharField(max_length=50, default="mobile")
     uploaded_at = models.DateTimeField(auto_now_add=True)
 
-    # ✅ NEW: saved prediction output (so patient history can show it)
+    # Saved prediction output
     prediction_topk = models.JSONField(null=True, blank=True)  # list[{label,p}]
     prediction_meta = models.JSONField(null=True, blank=True)  # dict
     predicted_at = models.DateTimeField(null=True, blank=True)
 
-    # ✅ NEW: preview image url (xml preview, digitized preview, etc.)
+    # Preview image url (xml preview, digitized preview, ...)
     preview_image_url = models.URLField(null=True, blank=True)
 
     def __str__(self):
         return f"ECGUpload #{self.pk} - {self.file.name} ({self.uploaded_at})"
 
 
-# ✅ NEW: Doctor Notes (multiple notes per patient, editable, with date)
 class DoctorNote(TimeStampedModel):
-    patient = models.ForeignKey(
-        Patient,
-        on_delete=models.CASCADE,
-        related_name="doctor_notes",
-    )
+    """Multiple notes per patient, editable, with dates."""
+
+    patient = models.ForeignKey(Patient, on_delete=models.CASCADE, related_name="doctor_notes")
     text = models.TextField()
 
-    # Optional: who wrote it (if you later add authentication)
     author = models.ForeignKey(
-        User,
-        null=True,
-        blank=True,
-        on_delete=models.SET_NULL,
-        related_name="doctor_notes",
+        User, null=True, blank=True, on_delete=models.SET_NULL, related_name="doctor_notes"
     )
 
     class Meta:
