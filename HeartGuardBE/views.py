@@ -33,6 +33,8 @@ from HeartGuardBE.inference.preprocess_3x4 import preprocess_3x4
 from HeartGuardBE.inference.nnunet_runner import run_nnunet
 from HeartGuardBE.inference.digitize_binary_3x4 import digitize_from_binary_mask_3x4
 from HeartGuardBE.inference.vis_504_outputs import plot_like_original_3x4 as plot_like_original_3x4_vis
+from HeartGuardBE.protoecgnet_Model.turn_aecg_to_png import save_ecg_with_footer as save_aecg_with_footer
+from HeartGuardBE.protoecgnet_Model.turn_aecg_to_png import extract_aecg_parameters
 
 from HeartGuardBE.inference.xml_preview import generate_xml_preview_png
 
@@ -286,164 +288,6 @@ def _make_preview_for_aecg(leads_mV, fs, *, base_stem: str, request=None):
 
     except Exception as e:
         print("⚠️ aECG preview generation failed:", e)
-        return None, None
-
-def _make_preview_from_X(X, fs, *, base_stem: str, style: str = "3x4+rhythm"):
-    """
-    Create preview PNG from numeric X (output of preprocess_single_ecg).
-    style:
-      - "stacked": 12 stacked leads
-      - "3x4+rhythm": ECG paper style (3x4) + rhythm strip (lead II)
-    Returns (relative_url, meta) or (None, None).
-    """
-    try:
-        import numpy as np
-        import matplotlib
-        matplotlib.use("Agg")
-        import matplotlib.pyplot as plt
-        from django.conf import settings
-
-        x = np.asarray(X)
-        x = np.squeeze(x)
-
-        if x.ndim != 2:
-            print("⚠️ preview_from_X: unexpected shape:", getattr(x, "shape", None))
-            return None, None
-
-        # ensure [12, N]
-        if x.shape[0] != 12 and x.shape[1] == 12:
-            x = x.T
-
-        if x.shape[0] < 1:
-            print("⚠️ preview_from_X: empty leads")
-            return None, None
-
-        n_leads = x.shape[0]
-        n = x.shape[1]
-
-        previews_dir = _media_root() / "ecg_previews"
-        previews_dir.mkdir(parents=True, exist_ok=True)
-        out_png = previews_dir / f"{base_stem}_preview.png"
-
-        lead_names = ["I","II","III","aVR","aVL","aVF","V1","V2","V3","V4","V5","V6"]
-        lead_names = lead_names[:n_leads]
-
-        # Helper: "ECG paper" grid
-        def _ecg_grid(ax, seconds_span, mv_span):
-            # small squares: 0.04s, 0.1mV
-            ax.set_xlim(0, seconds_span)
-            ax.set_ylim(-mv_span, mv_span)
-
-            # major squares: 0.2s, 0.5mV
-            ax.set_xticks(np.arange(0, seconds_span + 1e-9, 0.2))
-            ax.set_xticks(np.arange(0, seconds_span + 1e-9, 0.04), minor=True)
-
-            ax.set_yticks(np.arange(-mv_span, mv_span + 1e-9, 0.5))
-            ax.set_yticks(np.arange(-mv_span, mv_span + 1e-9, 0.1), minor=True)
-
-            ax.grid(which="major", alpha=0.25, linewidth=0.8)
-            ax.grid(which="minor", alpha=0.10, linewidth=0.5)
-
-            ax.tick_params(which="both", length=0)
-            ax.set_xticklabels([])
-            ax.set_yticklabels([])
-
-        # ===== Choose output style =====
-        if style == "stacked":
-            t = np.arange(n) / float(fs)
-            fig_h = max(6, n_leads * 1.0)
-            plt.figure(figsize=(14, fig_h))
-            for i in range(n_leads):
-                ax = plt.subplot(n_leads, 1, i + 1)
-                ax.plot(t, x[i], linewidth=0.9)
-                ax.set_ylabel(lead_names[i] if i < len(lead_names) else f"L{i+1}",
-                              rotation=0, labelpad=18, fontsize=9)
-                ax.grid(True, alpha=0.25)
-                if i != n_leads - 1:
-                    ax.set_xticks([])
-                else:
-                    ax.set_xlabel("Time (s)")
-            plt.tight_layout()
-            plt.savefig(out_png, dpi=160)
-            plt.close()
-
-        else:
-            # "3x4+rhythm" layout (like your friend's image)
-            # We show 2.5s per small panel so 4 panels cover 10s
-            total_seconds = n / float(fs)
-            panel_seconds = min(2.5, total_seconds)  # 2.5s per lead cell
-            panel_samples = int(panel_seconds * fs)
-
-            # If your signal is exactly 10s at fs=100 => 1000 samples, panel_samples=250
-            # Use first 10 seconds if longer
-            max_seconds = 10.0
-            max_samples = min(n, int(max_seconds * fs))
-
-            # slice usable segment
-            x_use = x[:, :max_samples]
-            n_use = x_use.shape[1]
-            total_seconds_use = n_use / float(fs)
-
-            # recompute panel
-            panel_seconds = min(2.5, total_seconds_use)
-            panel_samples = max(1, int(panel_seconds * fs))
-
-            # rhythm strip will use full width (up to 10s)
-            rhythm_idx = 1 if n_leads >= 2 else 0  # II preferred
-
-            # amplitude span (mV): use robust scaling
-            # take percentile to avoid outliers
-            amp = np.percentile(np.abs(x_use), 99)
-            mv_span = max(0.5, min(2.0, float(amp * 1.2)))  # clamp nice range
-
-            # Figure: 4 columns x 3 rows + 1 rhythm row
-            fig = plt.figure(figsize=(14, 8), constrained_layout=False)
-            gs = fig.add_gridspec(4, 4, height_ratios=[1, 1, 1, 1.4], hspace=0.30, wspace=0.15)
-
-            # lead order like standard ECG
-            order = [
-                0, 3, 6, 9,     # I, aVR, V1, V4
-                1, 4, 7, 10,    # II, aVL, V2, V5
-                2, 5, 8, 11     # III, aVF, V3, V6
-            ]
-            order = [i for i in order if i < n_leads]
-
-            # Plot 3x4
-            for k, lead_i in enumerate(order[:12]):
-                r = k // 4
-                c = k % 4
-                ax = fig.add_subplot(gs[r, c])
-
-                start = 0
-                end = min(panel_samples, n_use)
-                t = np.arange(end - start) / float(fs)
-
-                _ecg_grid(ax, seconds_span=(end - start) / float(fs), mv_span=mv_span)
-                ax.plot(t, x_use[lead_i, start:end], linewidth=1.0)
-                ax.text(0.02, 0.85, lead_names[lead_i] if lead_i < len(lead_names) else f"L{lead_i+1}",
-                        transform=ax.transAxes, fontsize=10, fontweight="bold")
-
-            # Rhythm strip (full width)
-            axr = fig.add_subplot(gs[3, :])
-            t = np.arange(n_use) / float(fs)
-            _ecg_grid(axr, seconds_span=total_seconds_use, mv_span=mv_span)
-            axr.plot(t, x_use[rhythm_idx, :], linewidth=1.0)
-            axr.text(0.01, 0.85, "II", transform=axr.transAxes, fontsize=10, fontweight="bold")
-            axr.set_xlabel("Time (s)")
-
-            # small footer like report
-            fig.suptitle("aECG Preview", fontsize=14, fontweight="bold", y=0.98)
-
-            fig.tight_layout(rect=[0, 0, 1, 0.97])
-            fig.savefig(out_png, dpi=170)
-            plt.close(fig)
-
-        rel_url = f"{settings.MEDIA_URL.rstrip('/')}/ecg_previews/{out_png.name}"
-        meta = {"fs": float(fs), "n_leads": int(n_leads), "n_samples": int(n), "shape": list(x.shape), "style": style}
-        return rel_url, meta
-
-    except Exception as e:
-        print("⚠️ preview_from_X failed:", e)
         return None, None
 
 # ===========================
@@ -870,6 +714,42 @@ def list_ecgs_for_patient(request):
         for e in ecgs
     ], safe=False, status=200)
 
+def _save_preview_png(leads_mV: dict, fs: float, fmt: str, filename_stem: str, file_bytes: bytes) -> dict:
+    media_root = Path(getattr(settings, "MEDIA_ROOT", Path.cwd() / "media"))
+    job_id = uuid.uuid4().hex
+
+    out_dir = media_root / "ecg_previews" / fmt / job_id
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    out_png = out_dir / f"{filename_stem}.png"
+
+    if fmt == "aecg":
+        meas = extract_aecg_parameters(file_bytes)
+
+        settings_ = {"Speed_mm_s": 25, "Gain_mm_mV": 10, "Highpass_Hz": None, "Lowpass_Hz": None, "Notch_Hz": None}
+        statements = []
+
+        save_aecg_with_footer(
+            lead_signals=leads_mV,
+            sampling_rate_hz=int(round(fs)),
+            out_png=out_png,
+            title=f"aECG Preview — {filename_stem}",
+            meas=meas,
+            settings=settings_,
+            statements=statements,
+            segment_seconds=2.5,
+            rhythm_seconds=10.0,
+            show_grid=True,
+        )
+    else:
+        raise ValueError("preview png only supported for aecg here")
+
+    rel_path = out_png.relative_to(media_root).as_posix()
+    url = None
+    if getattr(settings, "MEDIA_URL", None):
+        url = settings.MEDIA_URL.rstrip("/") + "/" + rel_path
+
+    return {"preview_relpath": rel_path, "preview_url": url, "job_id": job_id}
 
 @csrf_exempt
 def predict_ecg(request):
@@ -975,13 +855,17 @@ def predict_ecg(request):
             out = [{"label": labels[i], "p": float(probs[i])} for i in idx]
 
             # ✅ aECG preview (same structure as XML)
-            # after X, fs_out = preprocess_single_ecg(...)
-            preview_url, preview_meta = _make_preview_from_X(
-                X,
-                fs_out,
-                base_stem=f"predict_{uuid.uuid4().hex}",
-                style="3x4+rhythm"
+            preview = _save_preview_png(
+                leads_mV=leads_mV,
+                fs=fs,
+                fmt="aecg",
+                filename_stem=Path(getattr(up, "name", "upload.aecg")).stem,
+                file_bytes=file_bytes,
                 )
+            
+            preview_url = preview.get("preview_url")
+            if preview_url and request is not None:
+                preview_url = request.build_absolute_uri(preview_url)
 
             resp = {
                 "topk": out,
@@ -990,10 +874,10 @@ def predict_ecg(request):
                     "fs_in": fs,
                     "fs_out": fs_out,
                     "aecg_meta": meta,
-                },
-                "preview_image_url": preview_url,
-                "preview_meta": preview_meta,
+                    **preview,   # <- adds preview_url, preview_relpath, job_id
+                    },
             }
+
 
             if ecg_obj:
                 ecg_obj.prediction_topk = resp["topk"]
