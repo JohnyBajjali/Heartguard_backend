@@ -13,7 +13,7 @@ from django.views.decorators.csrf import csrf_exempt
 from django.views.decorators.http import require_GET
 from django.core.exceptions import ValidationError
 
-from .models import Patient, ECGUpload
+from .models import Patient, ECGUpload, DoctorNote  # ✅ CHANGED (added DoctorNote)
 from .protoecgnet_Model.philips_xml import read_hospital_ecg_xml_repbeats
 from .protoecgnet_Model.aecg_hl7 import read_aecg_hl7_bytes
 from .protoecgnet_Model.preprocess import preprocess_single_ecg
@@ -23,8 +23,9 @@ from HeartGuardBE.protoecgnet_Model import predictor
 from HeartGuardBE.inference.postprocess import nii_to_png_mask
 from HeartGuardBE.inference.preprocess_3x4 import preprocess_3x4
 from HeartGuardBE.inference.nnunet_runner import run_nnunet
-from HeartGuardBE.inference.digitize_binary_3x4 import digitize_from_binary_mask_3x4 
+from HeartGuardBE.inference.digitize_binary_3x4 import digitize_from_binary_mask_3x4
 from HeartGuardBE.inference.vis_504_outputs import plot_like_original_3x4 as plot_like_original_3x4_vis
+
 
 def normalize_name(name: str) -> str:
     return " ".join((name or "").strip().split()).lower()
@@ -215,7 +216,7 @@ def patients_list_create(request):
                 "gender": p.gender,
                 "created_at": p.created_at.isoformat(),
                 "ecg_count": len(p.ecg_upload_ids or []),
-                })
+            })
 
         return JsonResponse({"patients": data}, status=200)
 
@@ -244,31 +245,30 @@ def patients_list_create(request):
             return JsonResponse({"error": "patient_id already exists"}, status=409)
 
         gender = data.get("gender", None)
-        
+
         if gender not in ("M", "F"):
             return JsonResponse(
                 {"error": "gender is required and must be 'M' or 'F'"},
                 status=400,
-                )
+            )
 
         if age_raw is None or str(age_raw).strip() == "":
             return JsonResponse({"error": "age is required"}, status=400)
-        
+
         try:
             age = int(str(age_raw).strip())
-            
         except Exception:
             return JsonResponse({"error": "age must be an integer"}, status=400)
-        
+
         if age < 1 or age > 130:
             return JsonResponse({"error": "age must be between 1 and 130"}, status=400)
 
         patient = Patient(
             patient_id=patient_id,
             full_name=full_name,
-            age=age,          # ✅ NEW
+            age=age,  # ✅ NEW
             gender=gender,
-            )
+        )
 
         try:
             patient.full_clean()
@@ -278,12 +278,12 @@ def patients_list_create(request):
 
         return JsonResponse({
             "patient": {
-            "patient_id": patient.patient_id,
-            "full_name": patient.full_name,
-            "age": patient.age,  # ✅ ADD THIS LINE
-            "gender": patient.gender,
-            "created_at": patient.created_at.isoformat(),
-            "ecg_count": len(patient.ecg_upload_ids or []),
+                "patient_id": patient.patient_id,
+                "full_name": patient.full_name,
+                "age": patient.age,
+                "gender": patient.gender,
+                "created_at": patient.created_at.isoformat(),
+                "ecg_count": len(patient.ecg_upload_ids or []),
             }}, status=201)
 
     return JsonResponse({"error": "Method not allowed"}, status=405)
@@ -549,6 +549,7 @@ def detect_ecg_format(file_bytes: bytes) -> str:
 
     return "unknown"
 
+
 def _norm_code(s: str) -> str:
     if s is None:
         return ""
@@ -665,12 +666,7 @@ def _predict_from_3x4_image_bytes(img_bytes: bytes, filename: str = "upload.png"
         }
     }
 
-
-
-
     return topk, meta
-
-
 
 
 @csrf_exempt
@@ -731,3 +727,115 @@ def predict_ecg(request):
     except Exception as e:
         return JsonResponse({"error": str(e), "format": fmt}, status=500)
 
+
+# ===========================
+# ✅ DOCTOR NOTES API (NEW)
+# ===========================
+
+@csrf_exempt
+def patient_notes(request, patient_id):
+    """
+    GET  /api/patients/<patient_id>/notes/  -> list notes
+    POST /api/patients/<patient_id>/notes/ -> create note
+    JSON body: {"text": "..."}
+    """
+    pid_raw = str(patient_id).strip()
+    if not pid_raw.isdigit():
+        return JsonResponse({"error": "patient_id must be an integer"}, status=400)
+    pid = int(pid_raw)
+
+    try:
+        patient = Patient.objects.get(patient_id=pid)
+    except Patient.DoesNotExist:
+        return JsonResponse({"error": "patient not found"}, status=404)
+
+    if request.method == "GET":
+        qs = DoctorNote.objects.filter(patient=patient).order_by("-created_at")
+        notes = [{
+            "id": n.id,
+            "patient_id": patient.patient_id,
+            "text": n.text,
+            "created_at": n.created_at.isoformat(),
+            "updated_at": n.updated_at.isoformat(),
+        } for n in qs]
+        return JsonResponse({"notes": notes}, status=200)
+
+    if request.method == "POST":
+        try:
+            data = json.loads(request.body.decode("utf-8"))
+        except Exception:
+            return JsonResponse({"error": "Invalid JSON body"}, status=400)
+
+        text = str(data.get("text", "")).strip()
+        if not text:
+            return JsonResponse({"error": "text is required"}, status=400)
+
+        note = DoctorNote.objects.create(patient=patient, text=text)
+
+        return JsonResponse({
+            "note": {
+                "id": note.id,
+                "patient_id": patient.patient_id,
+                "text": note.text,
+                "created_at": note.created_at.isoformat(),
+                "updated_at": note.updated_at.isoformat(),
+            }
+        }, status=201)
+
+    return JsonResponse({"error": "Method not allowed"}, status=405)
+
+
+@csrf_exempt
+def patient_note_detail(request, patient_id, note_id):
+    """
+    PATCH/PUT /api/patients/<patient_id>/notes/<note_id>/ -> edit note
+    DELETE    /api/patients/<patient_id>/notes/<note_id>/ -> delete note (optional)
+    JSON body: {"text": "..."}
+    """
+    pid_raw = str(patient_id).strip()
+    if not pid_raw.isdigit():
+        return JsonResponse({"error": "patient_id must be an integer"}, status=400)
+    pid = int(pid_raw)
+
+    try:
+        patient = Patient.objects.get(patient_id=pid)
+    except Patient.DoesNotExist:
+        return JsonResponse({"error": "patient not found"}, status=404)
+
+    try:
+        note = DoctorNote.objects.get(id=int(note_id), patient=patient)
+    except Exception:
+        return JsonResponse({"error": "note not found"}, status=404)
+
+    if request.method in ("PATCH", "PUT"):
+        try:
+            data = json.loads(request.body.decode("utf-8"))
+        except Exception:
+            return JsonResponse({"error": "Invalid JSON body"}, status=400)
+
+        text = data.get("text", None)
+        if text is None:
+            return JsonResponse({"error": "text is required"}, status=400)
+
+        text = str(text).strip()
+        if not text:
+            return JsonResponse({"error": "text cannot be empty"}, status=400)
+
+        note.text = text
+        note.save(update_fields=["text", "updated_at"])
+
+        return JsonResponse({
+            "note": {
+                "id": note.id,
+                "patient_id": patient.patient_id,
+                "text": note.text,
+                "created_at": note.created_at.isoformat(),
+                "updated_at": note.updated_at.isoformat(),
+            }
+        }, status=200)
+
+    if request.method == "DELETE":
+        note.delete()
+        return JsonResponse({"ok": True, "deleted_note_id": int(note_id)}, status=200)
+
+    return JsonResponse({"error": "Method not allowed"}, status=405)

@@ -118,7 +118,7 @@ class Patient(TimeStampedModel):
         blank=True,
         default=None,
     )
-    
+
     hospital = models.ForeignKey(
         Hospital,
         null=True,
@@ -214,3 +214,31 @@ class ECGUpload(models.Model):
 
     def __str__(self):
         return f"ECGUpload #{self.pk} - {self.file.name} ({self.uploaded_at})"
+
+
+# ✅ NEW: Doctor Notes (multiple notes per patient, editable, with date)
+class DoctorNote(TimeStampedModel):
+    patient = models.ForeignKey(
+        Patient,
+        on_delete=models.CASCADE,
+        related_name="doctor_notes",
+    )
+    text = models.TextField()
+
+    # Optional: who wrote it (if you later add authentication)
+    author = models.ForeignKey(
+        User,
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="doctor_notes",
+    )
+
+    class Meta:
+        ordering = ["-created_at"]
+        indexes = [
+            models.Index(fields=["patient", "created_at"]),
+        ]
+
+    def __str__(self):
+        return f"DoctorNote #{self.pk} for Patient {self.patient.patient_id}"

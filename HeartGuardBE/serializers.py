@@ -1,7 +1,7 @@
 # HeartGuardBE/serializers.py
 from django.contrib.auth import get_user_model
 from rest_framework import serializers
-from .models import Hospital, Patient, EcgExam
+from .models import Hospital, Patient, EcgExam, DoctorNote
 
 User = get_user_model()
 
@@ -40,16 +40,20 @@ class EcgExamDetailSerializer(EcgExamListSerializer):
     class Meta(EcgExamListSerializer.Meta):
         fields = EcgExamListSerializer.Meta.fields + ["model_version"]
 
+# ✅ NEW: DoctorNote serializer
+class DoctorNoteSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = DoctorNote
+        fields = ["id", "patient", "text", "created_at", "updated_at", "author"]
+        read_only_fields = ["id", "created_at", "updated_at", "author"]
+
 # Current user payload for Flutter
 class CurrentUserSerializer(serializers.ModelSerializer):
-    # Keep shape tolerant; hospital is optional/None unless you model it on user
     hospital = serializers.SerializerMethodField()
 
     class Meta:
         model = User
         fields = ["id", "username", "first_name", "last_name", "email", "is_staff", "is_superuser", "hospital", "role"]
-        # 'role' only if your custom user has it; serializer will ignore if not present.
 
     def get_hospital(self, obj):
-        # If you later relate user->hospital, return it here
         return None
