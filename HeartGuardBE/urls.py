@@ -16,6 +16,7 @@ from .views import (
     ecg_auto_crop,
     predict_ecg,
     list_ecgs_for_patient,
+    ecg_delete,
 )
 
 urlpatterns = [
@@ -39,4 +40,5 @@ urlpatterns = [
     path("ecg/auto_crop/", ecg_auto_crop, name="ecg_auto_crop"),
     path("ecg/predict/", predict_ecg, name="predict_ecg"),
     path("ecg/list/", list_ecgs_for_patient, name="ecg_list_for_patient"),
+    path("ecg/delete/", ecg_delete, name="ecg_delete"),
 ]

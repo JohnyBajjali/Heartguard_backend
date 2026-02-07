@@ -19,6 +19,8 @@ from django.http import HttpResponse, JsonResponse
 from django.utils import timezone
 from django.views.decorators.csrf import csrf_exempt
 from django.views.decorators.http import require_GET
+from django.utils.decorators import method_decorator
+from django.http import JsonResponse
 
 from django.core.files.base import ContentFile
 
@@ -1058,7 +1060,7 @@ def predict_ecg(request):
     except Exception as e:
         return JsonResponse({"error": str(e), "format": fmt}, status=500)
 
-
+@csrf_exempt
 def patient_notes(request, patient_id):
     pid_raw = str(patient_id).strip()
     if not pid_raw.isdigit():
@@ -1155,3 +1157,53 @@ def patient_note_detail(request, patient_id, note_id):
         return JsonResponse({"ok": True, "deleted_note_id": int(note_id)}, status=200)
 
     return JsonResponse({"error": "Method not allowed"}, status=405)
+
+@csrf_exempt
+def ecg_delete(request):
+    if request.method != "POST":
+        return JsonResponse({"error": "Method not allowed"}, status=405)
+
+    try:
+        data = json.loads(request.body.decode("utf-8"))
+    except Exception:
+        return JsonResponse({"error": "Invalid JSON body"}, status=400)
+
+    ecg_id = data.get("ecg_id")
+    patient_id = data.get("patient_id")
+
+    if ecg_id is None or patient_id is None:
+        return JsonResponse({"error": "ecg_id and patient_id are required"}, status=400)
+
+    try:
+        ecg_id = int(ecg_id)
+        patient_id = int(patient_id)
+    except Exception:
+        return JsonResponse({"error": "ecg_id and patient_id must be integers"}, status=400)
+
+    try:
+        patient = Patient.objects.get(patient_id=patient_id)
+    except Patient.DoesNotExist:
+        return JsonResponse({"error": "patient not found"}, status=404)
+
+    try:
+        ecg = ECGUpload.objects.get(id=ecg_id)
+    except ECGUpload.DoesNotExist:
+        return JsonResponse({"error": "ecg not found"}, status=404)
+
+    # 1) Remove from patient history list
+    ids = patient.ecg_upload_ids or []
+    ids = [x for x in ids if int(x) != ecg_id]
+    patient.ecg_upload_ids = ids
+    patient.save(update_fields=["ecg_upload_ids"])
+
+    # 2) Delete file from storage (optional but recommended)
+    try:
+        if ecg.file and hasattr(ecg.file, "path") and os.path.exists(ecg.file.path):
+            os.remove(ecg.file.path)
+    except Exception:
+        pass
+
+    # 3) Delete row
+    ecg.delete()
+
+    return JsonResponse({"ok": True, "deleted_ecg_id": ecg_id}, status=200)
