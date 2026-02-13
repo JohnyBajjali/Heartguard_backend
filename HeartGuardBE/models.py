@@ -202,6 +202,18 @@ class ECGUpload(models.Model):
     def __str__(self):
         return f"ECGUpload #{self.pk} - {self.file.name} ({self.uploaded_at})"
 
+class EcgNote(models.Model):
+    ecg = models.ForeignKey(ECGUpload, on_delete=models.CASCADE, related_name="notes")
+    text = models.TextField()
+
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ["-created_at"]
+
+    def __str__(self):
+        return f"EcgNote(ecg_id={self.ecg_id})"
 
 class DoctorNote(TimeStampedModel):
     """Multiple notes per patient, editable, with dates."""
@@ -221,3 +233,4 @@ class DoctorNote(TimeStampedModel):
 
     def __str__(self):
         return f"DoctorNote #{self.pk} for Patient {self.patient.patient_id}"
+    

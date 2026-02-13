@@ -17,6 +17,11 @@ from .views import (
     predict_ecg,
     list_ecgs_for_patient,
     ecg_delete,
+
+    # ECG Notes
+    ecg_notes,
+    ecg_note_detail,
+
 )
 
 urlpatterns = [
@@ -32,6 +37,13 @@ urlpatterns = [
     # -------------------------
     path("patients/<str:patient_id>/notes/", patient_notes, name="patient_notes"),
     path("patients/<str:patient_id>/notes/<int:note_id>/", patient_note_detail, name="patient_note_detail"),
+
+    # -------------------------
+    # ECG Notes APIs
+    # -------------------------
+    path("ecg/notes/", ecg_notes, name="ecg_notes"),
+    path("ecg/notes/add/", ecg_notes, name="ecg_notes_add"),  # ✅ ADD THIS LINE
+    path("ecg/notes/<int:note_id>/", ecg_note_detail, name="ecg_note_detail"),
 
     # -------------------------
     # ECG APIs

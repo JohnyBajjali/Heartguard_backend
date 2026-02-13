@@ -24,7 +24,7 @@ from django.http import JsonResponse
 
 from django.core.files.base import ContentFile
 
-from .models import Patient, ECGUpload, DoctorNote
+from .models import Patient, ECGUpload, DoctorNote, EcgNote
 
 from .protoecgnet_Model.philips_xml import read_hospital_ecg_xml_repbeats
 from .protoecgnet_Model.aecg_hl7 import read_aecg_hl7_bytes
@@ -40,7 +40,6 @@ from HeartGuardBE.protoecgnet_Model.turn_aecg_to_png import save_ecg_with_footer
 from HeartGuardBE.protoecgnet_Model.turn_aecg_to_png import extract_aecg_parameters
 
 from HeartGuardBE.inference.xml_preview import generate_xml_preview_png
-
 
 # ----------------------------
 # Utils
@@ -718,6 +717,120 @@ def ecg_upload(request):
         "preview_image_url": preview_url,
         "preview_meta": preview_meta,
     }, status=201)
+
+@csrf_exempt
+def ecg_notes(request):
+    """
+    GET  /api/ecg/notes/?ecg_id=123   -> list notes for ECG
+    POST /api/ecg/notes/             -> add note {ecg_id, text}
+    """
+    if request.method == "GET":
+        ecg_id_raw = (request.GET.get("ecg_id", "") or "").strip()
+        if not ecg_id_raw.isdigit():
+            return JsonResponse({"error": "ecg_id must be an integer"}, status=400)
+        ecg_id = int(ecg_id_raw)
+
+        if not ECGUpload.objects.filter(id=ecg_id).exists():
+            return JsonResponse({"error": "ecg not found"}, status=404)
+
+        qs = EcgNote.objects.filter(ecg_id=ecg_id).order_by("-created_at")
+        notes = [{
+            "id": n.id,
+            "ecg_id": ecg_id,
+            "text": n.text,
+            "created_at": n.created_at.isoformat(),
+            "updated_at": n.updated_at.isoformat(),
+        } for n in qs]
+
+        return JsonResponse(notes, safe=False, status=200)
+
+    if request.method == "POST":
+        try:
+            data = json.loads(request.body.decode("utf-8"))
+        except Exception:
+            return JsonResponse({"error": "Invalid JSON body"}, status=400)
+
+        ecg_id = data.get("ecg_id")
+        text = str(data.get("text", "")).strip()
+
+        if ecg_id is None:
+            return JsonResponse({"error": "ecg_id is required"}, status=400)
+        try:
+            ecg_id = int(ecg_id)
+        except Exception:
+            return JsonResponse({"error": "ecg_id must be an integer"}, status=400)
+
+        if not text:
+            return JsonResponse({"error": "text is required"}, status=400)
+
+        try:
+            ecg = ECGUpload.objects.get(id=ecg_id)
+        except ECGUpload.DoesNotExist:
+            return JsonResponse({"error": "ecg not found"}, status=404)
+
+        note = EcgNote.objects.create(ecg=ecg, text=text)
+
+        return JsonResponse({
+            "note": {
+                "id": note.id,
+                "ecg_id": ecg_id,
+                "text": note.text,
+                "created_at": note.created_at.isoformat(),
+                "updated_at": note.updated_at.isoformat(),
+            }
+        }, status=201)
+
+    return JsonResponse({"error": "Method not allowed"}, status=405)
+
+
+@csrf_exempt
+def ecg_note_detail(request, note_id):
+    """
+    PATCH/PUT /api/ecg/notes/<note_id>/   -> update {text}
+    DELETE    /api/ecg/notes/<note_id>/   -> delete
+    """
+    try:
+        nid = int(note_id)
+    except Exception:
+        return JsonResponse({"error": "note_id must be an integer"}, status=400)
+
+    try:
+        note = EcgNote.objects.get(id=nid)
+    except EcgNote.DoesNotExist:
+        return JsonResponse({"error": "note not found"}, status=404)
+
+    if request.method in ("PATCH", "PUT"):
+        try:
+            data = json.loads(request.body.decode("utf-8"))
+        except Exception:
+            return JsonResponse({"error": "Invalid JSON body"}, status=400)
+
+        text = data.get("text", None)
+        if text is None:
+            return JsonResponse({"error": "text is required"}, status=400)
+
+        text = str(text).strip()
+        if not text:
+            return JsonResponse({"error": "text cannot be empty"}, status=400)
+
+        note.text = text
+        note.save(update_fields=["text", "updated_at"])
+
+        return JsonResponse({
+            "note": {
+                "id": note.id,
+                "ecg_id": note.ecg_id,
+                "text": note.text,
+                "created_at": note.created_at.isoformat(),
+                "updated_at": note.updated_at.isoformat(),
+            }
+        }, status=200)
+
+    if request.method == "DELETE":
+        note.delete()
+        return JsonResponse({"ok": True, "deleted_note_id": nid}, status=200)
+
+    return JsonResponse({"error": "Method not allowed"}, status=405)
 
 @csrf_exempt
 def ecg_auto_crop(request):
