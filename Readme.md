@@ -14,6 +14,8 @@ This repository contains the backend: patient records, ECG uploads, notes, previ
 **Department:** Electrical & Computer Engineering  
 **Project report:** February 2026
 
+[View the full HeartGuard project report](Heartguard_report.pdf)
+
 This is a collaborative project. The repository was copied from the team's original backend repository while preserving Git commit history and contributor attribution. Hosting this copy under Johny Bajjali's account does not imply sole authorship of the code or models.
 
 Johny's contribution focused on the application layer, including Flutter development, Django API integration, database setup, patient records, ECG uploads, and presentation of model results.
