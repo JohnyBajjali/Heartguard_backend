@@ -168,8 +168,6 @@ The team report, **“Heart Guard: An AI-Based System for ECG Image Digitisation
 
 Useful sections include Chapter 3 (system architecture), Chapters 5–7 (processing/model methods), and Chapter 8 (Flutter/Django implementation and API mapping). The report describes the overall team project; this README describes the backend repository and its setup requirements.
 
-The report is not bundled by this README. If it is published separately, use a copy reviewed for patient identifiers and third-party material, with the team's agreement.
-
 ## Research and Development Status
 
 - This is a research prototype, not a clinically approved diagnostic product.
